@@ -7,11 +7,27 @@
 use rust_decimal::Decimal;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::fmt;
 use std::str::FromStr;
 
 use crate::intern::InternedStr;
 use crate::{Amount, CostSpec, Position};
+
+/// Inline storage for `BookingResult::matched`.
+///
+/// STRICT booking (the default) always produces exactly one matched lot
+/// per posting; FIFO / LIFO frequently match a single lot too. Inline
+/// cap of 1 covers the hot case with zero heap allocation while still
+/// spilling to the heap for multi-lot matches.
+///
+/// **API surface note**: this is `pub(crate)` deliberately — we don't
+/// want to commit downstream consumers to `smallvec` as part of our
+/// public API contract. External code reads `BookingResult.matched` via
+/// the slice deref (`.iter()`, `.len()`, indexing) which works
+/// transparently. The concrete `SmallVec<[Position; 1]>` type is still
+/// reachable via the field type but isn't promoted into the crate root.
+pub(crate) type MatchedLots = SmallVec<[Position; 1]>;
 
 mod booking;
 
@@ -94,7 +110,19 @@ pub enum ReductionScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookingResult {
     /// Positions that were matched/reduced.
-    pub matched: Vec<Position>,
+    ///
+    /// Backed by [`SmallVec<[Position; 1]>`](smallvec::SmallVec) so the
+    /// single-match common case (always true under STRICT, common under
+    /// FIFO/LIFO) doesn't touch the heap. The concrete type derefs to
+    /// `[Position]`, so read-side patterns like `.iter()`,
+    /// `.len()`, `.is_empty()`, and indexing work unchanged.
+    ///
+    /// **Breaking API change in 0.15.0**: prior versions used
+    /// `Vec<Position>`. Downstream code that named the type explicitly
+    /// (`let v: Vec<Position> = result.matched`) or called Vec-specific
+    /// methods (`.capacity()`, `.reserve()`) needs to adapt; reading
+    /// the field through the slice deref keeps working.
+    pub matched: MatchedLots,
     /// The cost basis of the matched positions (for capital gains).
     pub cost_basis: Option<Amount>,
 }
