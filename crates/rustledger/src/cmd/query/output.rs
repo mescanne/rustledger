@@ -469,14 +469,14 @@ pub(super) fn format_value(value: &Value, numberify: bool, ctx: &DisplayContext)
         Value::Boolean(b) => b.to_string(),
         Value::Amount(a) => {
             if numberify {
-                ctx.format(a.number, a.currency.as_str())
+                ctx.format_amount_number(a.number, a.currency.as_str())
             } else {
                 ctx.format_amount(a.number, a.currency.as_str())
             }
         }
         Value::Position(p) => {
             if numberify {
-                ctx.format(p.units.number, p.units.currency.as_str())
+                ctx.format_amount_number(p.units.number, p.units.currency.as_str())
             } else {
                 let mut s = ctx.format_amount(p.units.number, p.units.currency.as_str());
                 if let Some(ref cost) = p.cost {
@@ -547,7 +547,7 @@ pub(super) fn format_value(value: &Value, numberify: bool, ctx: &DisplayContext)
                 .filter(|p| !position_renders_as_zero(p, ctx))
                 .map(|p| {
                     if numberify {
-                        ctx.format(p.units.number, p.units.currency.as_str())
+                        ctx.format_amount_number(p.units.number, p.units.currency.as_str())
                     } else {
                         let mut s = ctx.format_amount(p.units.number, p.units.currency.as_str());
                         if let Some(ref cost) = p.cost {
@@ -800,6 +800,33 @@ mod tests {
             rendered.contains("-0.01"),
             "-0.01 USD is exactly at USD precision; must still render. Got {rendered:?}"
         );
+    }
+
+    /// Pins post-#1113 fix: all three amount-typed values (`Value::Amount`,
+    /// `Value::Position`, `Value::Inventory`) must quantize to the
+    /// currency's tracked dp under `--numberify`, not preserve raw
+    /// arithmetic scale. Was a Copilot-review catch on #1113 — the
+    /// `Value::Amount` arm had been left on `format` while the other two
+    /// were moved to `format_amount_number`.
+    #[test]
+    fn test_numberify_quantizes_all_amount_kinds_consistently() {
+        let mut ctx = DisplayContext::new();
+        // USD tracked at 2dp.
+        ctx.update(dec!(100.00), "USD");
+        ctx.update(dec!(50.25), "USD");
+
+        let over_scale = dec!(-1202.00896);
+
+        // Each of Amount, Position, Inventory wraps the same scale-5 value.
+        let amount_val = Value::Amount(Amount::new(over_scale, "USD"));
+        let pos_val = Value::Position(Box::new(Position::simple(Amount::new(over_scale, "USD"))));
+        let mut inv = Inventory::new();
+        inv.add(Position::simple(Amount::new(over_scale, "USD")));
+        let inv_val = Value::Inventory(Box::new(inv));
+
+        assert_eq!(format_value(&amount_val, true, &ctx), "-1202.01");
+        assert_eq!(format_value(&pos_val, true, &ctx), "-1202.01");
+        assert_eq!(format_value(&inv_val, true, &ctx), "-1202.01");
     }
 
     /// Issue #1104 cross-format coverage: the zero-position suppression
