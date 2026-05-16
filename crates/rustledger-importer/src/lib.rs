@@ -158,10 +158,49 @@ impl From<EnrichedImportResult> for ImportResult {
     }
 }
 
+impl From<ImportResult> for EnrichedImportResult {
+    /// Promote an [`ImportResult`] into an [`EnrichedImportResult`] by
+    /// attaching a default (uncategorized, no-fingerprint) [`Enrichment`]
+    /// to each directive. This is the cheap-default impl used by
+    /// [`Importer::extract_enriched`] when an importer does not provide
+    /// a custom enrichment path; format-specific importers should
+    /// override `extract_enriched` to produce real metadata.
+    fn from(result: ImportResult) -> Self {
+        let entries = result
+            .directives
+            .into_iter()
+            .enumerate()
+            .map(|(i, directive)| {
+                let enrichment = Enrichment {
+                    directive_index: i,
+                    confidence: 0.0,
+                    method: rustledger_ops::enrichment::CategorizationMethod::Default,
+                    alternatives: vec![],
+                    fingerprint: directive_fingerprint(&directive),
+                };
+                (directive, enrichment)
+            })
+            .collect();
+        let mut enriched = Self::new(entries);
+        for warning in result.warnings {
+            enriched = enriched.with_warning(warning);
+        }
+        enriched
+    }
+}
+
 /// Trait for file importers.
 ///
-/// Implementors of this trait can extract beancount directives from various
-/// file formats (CSV, OFX, QFX, etc.).
+/// Implementors of this trait are **stateless** — they describe a file
+/// format (OFX, CSV, ...), not a particular import job. Per-call
+/// configuration (target account, currency, column mappings) flows in
+/// via [`ImporterConfig`]. This lets a single instance live in
+/// [`ImporterRegistry`] and serve many imports without per-job
+/// construction.
+///
+/// Implementors should match on `config.importer_type` if they require
+/// format-specific config (e.g. `CsvImporter` needs `CsvConfig`), and
+/// return an error if the config variant doesn't match what they handle.
 pub trait Importer: Send + Sync {
     /// Returns the name of this importer.
     fn name(&self) -> &str;
@@ -172,8 +211,33 @@ pub trait Importer: Send + Sync {
     /// header patterns, or other quick heuristics.
     fn identify(&self, path: &Path) -> bool;
 
-    /// Extract directives from the given file.
-    fn extract(&self, path: &Path) -> Result<ImportResult>;
+    /// Extract directives from the given file using `config`.
+    ///
+    /// `config.account` and `config.currency` are common across all
+    /// formats; format-specific configuration lives in
+    /// `config.importer_type` (e.g. `ImporterType::Csv(CsvConfig)`).
+    fn extract(&self, path: &Path, config: &ImporterConfig) -> Result<ImportResult>;
+
+    /// Extract directives with per-directive enrichment metadata
+    /// (categorization confidence, method, alternatives, fingerprint).
+    ///
+    /// Default impl wraps [`Importer::extract`] and produces default
+    /// (uncategorized, no-alternative) enrichments with a computed
+    /// fingerprint. Importers that know how to produce *real*
+    /// categorization confidence (e.g. CSV via its mappings/regex/
+    /// merchant-dict rules engine) should override this method.
+    ///
+    /// Critical: this method exists on the trait — not just as a
+    /// concrete-type helper — so that WASM-loaded importers in wave
+    /// 2.3 can participate in the enriched pipeline (dedup, import-
+    /// suggestion confidence, etc.) without being downcast.
+    fn extract_enriched(
+        &self,
+        path: &Path,
+        config: &ImporterConfig,
+    ) -> Result<EnrichedImportResult> {
+        Ok(EnrichedImportResult::from(self.extract(path, config)?))
+    }
 
     /// Returns a description of what this importer handles.
     fn description(&self) -> &str {
@@ -206,31 +270,34 @@ pub fn auto_extract(
     account: &str,
     currency: &str,
 ) -> Result<EnrichedImportResult> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("Failed to read file {}: {e}", path.display()))?;
+
     // Check for OFX first
     if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("ofx") || ext.eq_ignore_ascii_case("qfx"))
     {
-        let ofx = ofx_importer::OfxImporter::new(account, currency);
-        return ofx.extract_from_string_enriched(&std::fs::read_to_string(path)?);
+        // OFX doesn't care about `importer_type` (its impl doesn't read
+        // it); inert Csv variant satisfies the type.
+        let cfg = config::ImporterConfig {
+            account: account.to_string(),
+            currency: Some(currency.to_string()),
+            importer_type: config::ImporterType::Csv(config::CsvConfig::default()),
+        };
+        return ofx_importer::OfxImporter.extract_from_string_enriched(&content, &cfg);
     }
 
     // Try CSV auto-inference
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Failed to read file {}: {e}", path.display()))?;
-
     let inferred = csv_inference::infer_csv_config(&content)
         .ok_or_else(|| anyhow::anyhow!("Could not infer CSV format from {}", path.display()))?;
 
-    let csv_config = inferred.to_csv_config();
-    let importer_config = config::ImporterConfig {
+    let cfg = config::ImporterConfig {
         account: account.to_string(),
         currency: Some(currency.to_string()),
-        amount_format: config::AmountFormat::default(),
-        importer_type: config::ImporterType::Csv(csv_config.clone()),
+        importer_type: config::ImporterType::Csv(inferred.to_csv_config()),
     };
-    let importer = csv_importer::CsvImporter::new(importer_config);
-    importer.extract_string_enriched(&content, &csv_config)
+    csv_importer::CsvImporter.extract_string_enriched(&content, &cfg)
 }
 
 #[cfg(test)]

@@ -1,5 +1,8 @@
 //! Registry for importers.
 
+use crate::config::ImporterConfig;
+use crate::csv_importer::CsvImporter;
+use crate::ofx_importer::OfxImporter;
 use crate::{ImportResult, Importer};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -8,7 +11,10 @@ use std::sync::Arc;
 /// Registry of importers.
 ///
 /// The registry holds a collection of importers and can automatically
-/// identify which importer to use for a given file.
+/// identify which importer to use for a given file. Importers are
+/// stateless under the protocol contract — they read per-call
+/// configuration from the [`ImporterConfig`] passed to `extract`, so a
+/// single registered instance serves many imports.
 pub struct ImporterRegistry {
     importers: Vec<Arc<dyn Importer>>,
 }
@@ -19,6 +25,15 @@ impl ImporterRegistry {
         Self {
             importers: Vec::new(),
         }
+    }
+
+    /// Create a registry seeded with the built-in importers (OFX/QFX and
+    /// CSV). This is the standard entry point for the CLI and embedders.
+    pub fn with_builtins() -> Self {
+        let mut r = Self::new();
+        r.register(OfxImporter);
+        r.register(CsvImporter);
+        r
     }
 
     /// Register a new importer.
@@ -36,14 +51,31 @@ impl ImporterRegistry {
         None
     }
 
-    /// Extract transactions from a file using the appropriate importer.
-    pub fn extract(&self, path: &Path) -> Result<ImportResult> {
+    /// Find an importer by exact case-insensitive name match, with one
+    /// ergonomic concession: slash-separated alternates in the importer's
+    /// `name()` are split and each part is matched independently. So an
+    /// importer named `"OFX/QFX"` is findable by `"ofx"`, `"OFX"`,
+    /// `"qfx"`, or `"OFX/QFX"` — but **not** by `"o"` or `"x"`.
+    pub fn find_by_name(&self, name: &str) -> Option<Arc<dyn Importer>> {
+        self.importers
+            .iter()
+            .find(|i| {
+                let full = i.name();
+                full.eq_ignore_ascii_case(name)
+                    || full.split('/').any(|part| part.eq_ignore_ascii_case(name))
+            })
+            .map(Arc::clone)
+    }
+
+    /// Extract transactions from a file using the appropriate importer
+    /// and the supplied configuration.
+    pub fn extract(&self, path: &Path, config: &ImporterConfig) -> Result<ImportResult> {
         let importer = self
             .identify(path)
             .with_context(|| format!("No importer found for file: {}", path.display()))?;
 
         importer
-            .extract(path)
+            .extract(path, config)
             .with_context(|| format!("Failed to extract from: {}", path.display()))
     }
 
@@ -90,7 +122,7 @@ mod tests {
             path.extension().is_some_and(|ext| ext == self.extension)
         }
 
-        fn extract(&self, _path: &Path) -> Result<ImportResult> {
+        fn extract(&self, _path: &Path, _config: &ImporterConfig) -> Result<ImportResult> {
             Ok(ImportResult::empty())
         }
 
@@ -173,9 +205,15 @@ mod tests {
 
     #[test]
     fn test_registry_extract_unknown_file() {
+        use crate::config::{CsvConfig, ImporterType};
         let registry = ImporterRegistry::new();
         let unknown_path = Path::new("document.pdf");
-        let result = registry.extract(unknown_path);
+        let config = ImporterConfig {
+            account: "Assets:Bank".into(),
+            currency: None,
+            importer_type: ImporterType::Csv(CsvConfig::default()),
+        };
+        let result = registry.extract(unknown_path, &config);
         assert!(result.is_err());
         assert!(
             result
@@ -183,6 +221,39 @@ mod tests {
                 .to_string()
                 .contains("No importer found")
         );
+    }
+
+    #[test]
+    fn test_with_builtins_seeds_registry() {
+        let registry = ImporterRegistry::with_builtins();
+        assert_eq!(registry.len(), 2);
+        // OFX/QFX should be identified
+        assert!(registry.identify(Path::new("statement.ofx")).is_some());
+        assert!(registry.identify(Path::new("statement.qfx")).is_some());
+        // CSV should be identified
+        assert!(registry.identify(Path::new("data.csv")).is_some());
+        // Unknown extensions are not handled
+        assert!(registry.identify(Path::new("doc.pdf")).is_none());
+    }
+
+    #[test]
+    fn test_find_by_name_case_insensitive_exact_or_slash_part() {
+        let registry = ImporterRegistry::with_builtins();
+        // Exact, case-insensitive
+        assert!(registry.find_by_name("OFX/QFX").is_some());
+        assert!(registry.find_by_name("ofx/qfx").is_some());
+        assert!(registry.find_by_name("Csv").is_some());
+        assert!(registry.find_by_name("CSV").is_some());
+        // Slash-separated alternates match independently
+        assert!(registry.find_by_name("ofx").is_some());
+        assert!(registry.find_by_name("OFX").is_some());
+        assert!(registry.find_by_name("qfx").is_some());
+        assert!(registry.find_by_name("QFX").is_some());
+        // Substring matches are NOT honored (no longer "contains")
+        assert!(registry.find_by_name("f").is_none());
+        assert!(registry.find_by_name("o").is_none());
+        // Unknown
+        assert!(registry.find_by_name("nonexistent").is_none());
     }
 
     #[test]
