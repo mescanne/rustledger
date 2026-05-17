@@ -32,6 +32,26 @@
 //! 1. Path specified via `--importers-config`
 //! 2. `importers.toml` in the current directory
 //! 3. `~/.config/rledger/importers.toml`
+//!
+//! # WASM importers (wave 2.3c+)
+//!
+//! Beyond the built-in CSV and OFX importers, `rledger extract` can
+//! load `.wasm` modules that implement the import ABI defined in
+//! `rustledger-plugin-types`. Two flags control discovery:
+//!
+//! - `--wasm-importer <PATH>` (repeatable) — register one specific
+//!   module. Right tool for ad-hoc usage.
+//! - `--wasm-importer-dir <DIR>` (repeatable) — scan a directory for
+//!   `*.wasm` files. Overrides `wasm_importer_dir` from
+//!   `importers.toml` entirely when any CLI flag is set.
+//!
+//! Priority (highest wins `identify()` collisions): CLI single-file
+//! > directory scan > built-ins.
+//!
+//! ```toml
+//! # Persistent multi-dir discovery in importers.toml:
+//! wasm_importer_dir = ["~/wasm-importers", "/opt/shared-importers"]
+//! ```
 
 mod config;
 mod duplicate;
@@ -41,9 +61,10 @@ use crate::cmd::completions::ShellType;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use config::{
-    build_config_from_entry, find_importers_config, find_matching_importers, load_importers_config,
+    build_config_from_entry, expand_tilde, find_importers_config, find_matching_importers,
+    load_importers_config,
 };
-use duplicate::{is_duplicate, is_ofx_file, load_existing_transactions};
+use duplicate::{is_duplicate, load_existing_transactions};
 use format_num_pattern::Locale;
 use rustledger_core::{Directive, FormatConfig, format_directive};
 use rustledger_importer::{Importer, ImporterConfig, ImporterRegistry, csv_importer::CsvImporter};
@@ -176,35 +197,74 @@ pub struct Args {
     /// Date for the balance assertion (defaults to today)
     #[arg(long, value_name = "DATE")]
     balance_date: Option<String>,
+
+    /// Register a specific WASM importer module ahead of the built-in
+    /// CSV/OFX importers. May be specified multiple times. Each
+    /// `<PATH>` must be a `.wasm` file. User-specified modules take
+    /// precedence over discovered ones and over built-ins — this is
+    /// the right flag for ad-hoc one-off usage.
+    #[arg(long, value_name = "PATH")]
+    wasm_importer: Vec<PathBuf>,
+
+    /// Scan a directory for `*.wasm` importer modules at startup. May
+    /// be specified multiple times for multi-dir setups. Overrides
+    /// `wasm_importer_dir` from `importers.toml` entirely when any
+    /// `--wasm-importer-dir` flag is present. Non-`.wasm` files are
+    /// silently skipped; subdirectories are not recursed into.
+    #[arg(long, value_name = "DIR")]
+    wasm_importer_dir: Vec<PathBuf>,
 }
 
-/// List available importers from a config file.
+/// List available importers — both TOML profiles and engines.
+///
+/// TOML profiles (for `--importer <name>`) and registered engines
+/// (built-in CSV/OFX plus any `--wasm-importer`/scanned modules) are
+/// orthogonal concepts: a TOML profile is a pre-configured
+/// [`ImporterConfig`] driven by `CsvImporter`; an engine is the actual
+/// trait implementation that consumes a config.
 pub fn list_importers(args: &Args) -> Result<()> {
-    let config_path = find_importers_config(args.config.as_deref())?
-        .context("--list-importers requires --config or an importers.toml in the current directory or ~/.config/rledger/")?;
-
-    let config = load_importers_config(&config_path)?;
-
-    if config.importers.is_empty() {
-        println!("No importers defined in {}", config_path.display());
-    } else {
-        println!("Available importers in {}:", config_path.display());
-        for imp in &config.importers {
-            if let Some(pattern) = &imp.filename_pattern {
-                println!(
-                    "  {} (pattern: {}) -> {}",
-                    imp.name,
-                    pattern,
-                    imp.account.as_deref().unwrap_or("(default)")
-                );
-            } else {
-                println!(
-                    "  {} -> {}",
-                    imp.name,
-                    imp.account.as_deref().unwrap_or("(default)")
-                );
+    // ===== TOML profiles =====
+    //
+    // Optional: if no config file is present we still want to list
+    // the registered engines, so this is a soft find rather than the
+    // hard "must have config" error the original code had.
+    if let Some(config_path) = find_importers_config(args.config.as_deref())? {
+        let config = load_importers_config(&config_path)?;
+        if config.importers.is_empty() {
+            println!("No TOML profiles in {}", config_path.display());
+        } else {
+            println!("TOML profiles in {}:", config_path.display());
+            for imp in &config.importers {
+                if let Some(pattern) = &imp.filename_pattern {
+                    println!(
+                        "  {} (pattern: {}) -> {}",
+                        imp.name,
+                        pattern,
+                        imp.account.as_deref().unwrap_or("(default)")
+                    );
+                } else {
+                    println!(
+                        "  {} -> {}",
+                        imp.name,
+                        imp.account.as_deref().unwrap_or("(default)")
+                    );
+                }
             }
         }
+    } else {
+        println!("(no importers.toml found — listing registered engines only)");
+    }
+    println!();
+
+    // ===== Registered importer engines =====
+    //
+    // Always shown — at minimum CSV + OFX, plus any WASM-discovered
+    // modules. Build a fresh registry from args so users see exactly
+    // what this invocation would dispatch through.
+    let registry = build_registry(args)?;
+    println!("Registered importer engines:");
+    for (name, description) in registry.list_importers() {
+        println!("  {name} - {description}");
     }
 
     Ok(())
@@ -212,18 +272,25 @@ pub fn list_importers(args: &Args) -> Result<()> {
 
 /// Pick the importer for a given file + CLI args.
 ///
-/// - If the user explicitly chose a TOML entry (`--importer`) or a TOML
-///   path (`--config`), force [`CsvImporter`]: TOML entries are
-///   CSV-only by definition of [`rustledger_importer::config::ImporterType`]
-///   today, and forcing this prevents a regression where a CSV-shaped
-///   TOML entry applied to a `.ofx`-named file would silently dispatch
-///   to `OfxImporter` and drop the user's column mappings.
-/// - Otherwise let the registry identify by extension.
+/// - If the user explicitly chose a TOML entry (`--importer <name>`),
+///   force [`CsvImporter`]: TOML profiles are CSV-only by definition
+///   of [`rustledger_importer::config::ImporterType`] today, and the
+///   profile's column mappings would be lost if registry-identify
+///   silently routed the file to a different engine (e.g. a
+///   `.ofx`-named file picked up by `OfxImporter`).
+/// - Otherwise let the registry identify by extension. This is the
+///   path WASM importers reach via `--wasm-importer` /
+///   `--wasm-importer-dir` — including when combined with
+///   `--config` for pattern-matched TOML profiles. (Earlier this
+///   function also force-CSV'd when `--config` was set alone; that
+///   meant `--wasm-importer my.wasm --config x.toml` silently
+///   ignored the WASM module. Fixed by limiting the force-CSV path
+///   to `--importer`.)
 /// - Fall back to [`CsvImporter`] for unknown extensions (e.g. `.qbo`
-///   Quicken exports) so users with custom-extension TOML entries keep
-///   working.
+///   Quicken exports) so users with custom-extension TOML entries
+///   keep working.
 fn select_importer(registry: &ImporterRegistry, file: &Path, args: &Args) -> Arc<dyn Importer> {
-    if args.importer.is_some() || args.config.is_some() {
+    if args.importer.is_some() {
         Arc::new(CsvImporter)
     } else {
         registry
@@ -232,15 +299,154 @@ fn select_importer(registry: &ImporterRegistry, file: &Path, args: &Args) -> Arc
     }
 }
 
+/// Resolve the list of directories to scan for WASM importers.
+///
+/// Top-level dispatcher; the two real branches are
+/// [`resolve_scan_dirs_explicit`] (user named a config file with
+/// `--config`, errors propagate) and [`resolve_scan_dirs_implicit`]
+/// (no flag, soft-discover from default locations, errors warn-and-
+/// degrade). CLI `--wasm-importer-dir` flags override both and
+/// short-circuit the toml lookup entirely.
+fn resolve_scan_dirs(args: &Args) -> Result<Vec<PathBuf>> {
+    if !args.wasm_importer_dir.is_empty() {
+        return Ok(args.wasm_importer_dir.clone());
+    }
+    match args.config.as_deref() {
+        Some(path) => resolve_scan_dirs_explicit(path),
+        None => Ok(resolve_scan_dirs_implicit()),
+    }
+}
+
+/// User passed `--config <path>` explicitly. Missing or malformed
+/// file is a real error — the user asked for this file by name, so
+/// silently degrading would hide the bug they want to know about.
+fn resolve_scan_dirs_explicit(path: &Path) -> Result<Vec<PathBuf>> {
+    let cfg_path = find_importers_config(Some(path))?
+        .ok_or_else(|| anyhow!("Importers config not found: {}", path.display()))?;
+    let cfg = load_importers_config(&cfg_path)?;
+    Ok(cfg
+        .wasm_importer_dir
+        .into_vec()
+        .into_iter()
+        .map(|p| expand_tilde(&p))
+        .collect())
+}
+
+/// No `--config` flag — soft-discover in default locations
+/// (cwd `importers.toml` then `~/.config/rledger/importers.toml`).
+/// A missing file is expected; a malformed file is unusual but not
+/// fatal (the user didn't explicitly point at it). Print a warning
+/// for the malformed case so the user can find their mistake.
+fn resolve_scan_dirs_implicit() -> Vec<PathBuf> {
+    let cfg_path = match find_importers_config(None) {
+        Ok(Some(p)) => p,
+        Ok(None) | Err(_) => return Vec::new(),
+    };
+    match load_importers_config(&cfg_path) {
+        Ok(cfg) => cfg
+            .wasm_importer_dir
+            .into_vec()
+            .into_iter()
+            .map(|p| expand_tilde(&p))
+            .collect(),
+        Err(e) => {
+            // Visible warning instead of silent loss — the user's
+            // wasm_importer_dir setting would otherwise vanish with
+            // no signal that the file even exists.
+            eprintln!(
+                "warning: implicit importers.toml at {} failed to parse: {e:#}; ignoring wasm_importer_dir",
+                cfg_path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Build an [`ImporterRegistry`] with WASM importers registered ahead
+/// of the built-in CSV/OFX importers, so user-discovered modules win
+/// the `identify()` race. Priority (highest first):
+///
+/// 1. CLI `--wasm-importer <PATH>` (explicit per-invocation,
+///    repeatable)
+/// 2. CLI `--wasm-importer-dir <DIR>` (repeatable) OR
+///    `wasm_importer_dir` from `importers.toml` (CLI flags win
+///    entirely — they're not merged with the toml setting)
+/// 3. Built-in CSV + OFX importers (always present, registered last)
+///
+/// Per-dir scan failures (a single malformed `.wasm` among many) are
+/// logged to stderr but don't abort startup — see [`register_wasm_dir`]'s
+/// skip-and-collect semantics.
+fn build_registry(args: &Args) -> Result<ImporterRegistry> {
+    let mut registry = ImporterRegistry::new();
+
+    // 1. CLI --wasm-importer paths (explicit precedence — registered
+    //    first so they win identify()). Single-file failures abort
+    //    because the user explicitly named this path; if it's wrong,
+    //    silently skipping would be worse than erroring out.
+    for path in &args.wasm_importer {
+        let name = registry
+            .register_wasm_from_path(path)
+            .with_context(|| format!("failed to load WASM importer {}", path.display()))?;
+        eprintln!("loaded WASM importer `{name}` from {}", path.display());
+    }
+
+    // 2. Directory scan(s): CLI flags override toml entirely.
+    //    Multiple dirs are scanned in order. `~` is expanded for
+    //    toml-supplied paths (CLI paths get shell expansion).
+    let scan_dirs: Vec<PathBuf> = resolve_scan_dirs(args)?;
+    for dir in &scan_dirs {
+        let report = registry
+            .register_wasm_dir(dir)
+            .with_context(|| format!("failed to scan WASM importer directory {}", dir.display()))?;
+        if !report.loaded.is_empty() || !report.failures.is_empty() {
+            eprintln!(
+                "WASM importer scan {}: loaded {}, failed {}",
+                dir.display(),
+                report.loaded.len(),
+                report.failures.len(),
+            );
+        }
+        for (failed_path, err) in &report.failures {
+            eprintln!("  warning: failed to load {}: {err}", failed_path.display());
+        }
+    }
+
+    // 3. Built-ins last so any user importer takes precedence on
+    //    identify() collisions.
+    registry.register(rustledger_importer::OfxImporter);
+    registry.register(rustledger_importer::csv_importer::CsvImporter);
+
+    Ok(registry)
+}
+
 /// Run the extract command with the given arguments.
 pub fn run(args: &Args, file: &Path) -> Result<()> {
-    let registry = ImporterRegistry::with_builtins();
+    let registry = build_registry(args)?;
 
-    // Build the per-call ImporterConfig + fallback-account list. The OFX
-    // branch produces a minimal CSV-variant carrier (OfxImporter ignores
-    // `importer_type`); the CSV branch builds the full CsvConfig from
-    // --importer/--config/--auto/raw-args sources.
-    let (config, fallback_accounts) = if is_ofx_file(file) && args.importer.is_none() {
+    // Pick the dispatcher BEFORE building config: only `CsvImporter`
+    // needs the elaborate `--importer`/`--config`/`--auto` config
+    // path. WASM importers and `OfxImporter` consume a minimal default
+    // config (account + currency; the rest is either projected via
+    // the WASM wire format's `options` map or ignored). Building the
+    // CSV config eagerly would error on "No importers defined" when a
+    // user runs e.g. `--config x.toml --wasm-importer my.wasm` with
+    // an x.toml that only sets `wasm_importer_dir`.
+    let importer = select_importer(&registry, file, args);
+
+    // Stringly-typed dispatcher check: `CsvImporter::name()` returns
+    // the literal "CSV". Acceptable coupling for a CLI-internal
+    // routing decision; a trait method would be over-design for one
+    // call site.
+    let dispatcher_needs_minimal_config = importer.name() != "CSV";
+
+    // Build the per-call ImporterConfig + fallback-account list.
+    //
+    // - Non-CSV dispatcher (OFX, WASM, future builtins): minimal
+    //   default config — account + currency, empty CsvConfig carrier
+    //   the WASM wire format projects via `options`.
+    // - CSV dispatcher: builds the full CsvConfig from
+    //   --importer/--config/--auto/raw-args sources.
+    let (config, fallback_accounts) = if dispatcher_needs_minimal_config {
         let cfg = rustledger_importer::ImporterConfig {
             account: args.account.clone(),
             currency: Some(args.currency.clone()),
@@ -248,11 +454,12 @@ pub fn run(args: &Args, file: &Path) -> Result<()> {
                 rustledger_importer::config::CsvConfig::default(),
             ),
         };
-        // OFX importer routes negative amounts to `Expenses:Unknown` and
-        // positive amounts to `Income:Unknown` (ofx_importer.rs's
+        // OFX importer routes negative amounts to `Expenses:Unknown`
+        // and positive amounts to `Income:Unknown` (ofx_importer.rs's
         // `parse_transaction`). Both must be in the fallback list so
-        // `--suggest-categories` re-categorizes income as well as expense
-        // transactions.
+        // `--suggest-categories` re-categorizes income as well as
+        // expense transactions. WASM importers may produce their own
+        // fallbacks; the host defaults are used when they don't.
         (
             cfg,
             vec!["Expenses:Unknown".to_string(), "Income:Unknown".to_string()],
@@ -448,9 +655,8 @@ pub fn run(args: &Args, file: &Path) -> Result<()> {
         (config, fallbacks)
     };
 
-    // Dispatch through the registry with explicit-flag override (see
-    // `select_importer` doc).
-    let importer = select_importer(&registry, file, args);
+    // `importer` was selected earlier so we could route config-
+    // building correctly; here it's used for the actual dispatch.
     let result = importer.extract(file, &config)?;
 
     // Print warnings
@@ -883,15 +1089,11 @@ default_expense = "Expenses:Uncategorized"
         }
     }
 
-    #[test]
-    fn test_is_ofx_file() {
-        assert!(is_ofx_file(Path::new("statement.ofx")));
-        assert!(is_ofx_file(Path::new("statement.OFX")));
-        assert!(is_ofx_file(Path::new("statement.qfx")));
-        assert!(is_ofx_file(Path::new("statement.QFX")));
-        assert!(!is_ofx_file(Path::new("statement.csv")));
-        assert!(!is_ofx_file(Path::new("statement.txt")));
-    }
+    // Note: the `is_ofx_file` helper was removed when the OFX-
+    // specific branch in `run()` was unified into the generic
+    // "non-CSV dispatcher" path. OFX extension matching is now
+    // owned entirely by `OfxImporter::identify` (via the registry),
+    // so no separate helper exists to test.
 
     // ===== Importer dispatch (select_importer) =====
     //
@@ -943,6 +1145,143 @@ default_expense = "Expenses:Uncategorized"
         let args = Args::parse_from(["extract", "ignored.qbo"]);
         let imp = select_importer(&registry, Path::new("foo.qbo"), &args);
         assert_eq!(imp.name(), "CSV");
+    }
+
+    #[test]
+    fn test_select_importer_config_alone_does_not_force_csv() {
+        // Regression: `--config x.toml` alone (no --importer) used to
+        // force CSV dispatch, which silently broke combinations like
+        // `--config x.toml --wasm-importer my-mt940.wasm foo.mt940`
+        // (registered WASM was never consulted). With the fix,
+        // --config alone consults the registry so WASM importers stay
+        // reachable. A .csv file still resolves to CSV via
+        // registry.identify, not via the force-CSV path.
+        use rustledger_importer::test_fixtures::identifying_wat;
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm_path = tmp.path().join("mt.wasm");
+        std::fs::write(
+            &wasm_path,
+            wat::parse_str(identifying_wat("mt9")).expect("WAT parses"),
+        )
+        .unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg_path = cfg_dir.path().join("importers.toml");
+        std::fs::write(&cfg_path, "").unwrap(); // empty but valid toml
+
+        let args = Args::parse_from([
+            "extract",
+            "foo.mt940",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--wasm-importer",
+            wasm_path.to_str().unwrap(),
+        ]);
+        let registry = build_registry(&args).expect("builds");
+        let imp = select_importer(&registry, Path::new("foo.mt940"), &args);
+        assert_eq!(
+            imp.name(),
+            "mt9",
+            "WASM importer should win when --config is set alone (no --importer)"
+        );
+    }
+
+    #[test]
+    fn resolve_scan_dirs_propagates_error_for_explicit_missing_config() {
+        // --config /missing.toml should error loudly, not silently
+        // degrade to "no WASM scan dirs".
+        let args = Args::parse_from([
+            "extract",
+            "--config",
+            "/this/path/does/not/exist/importers.toml",
+        ]);
+        let result = resolve_scan_dirs(&args);
+        let Err(err) = result else {
+            panic!("explicit missing --config should error");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does/not/exist"),
+            "error should name the missing path: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_scan_dirs_soft_fails_for_implicit_missing_config() {
+        // No --config provided, no importers.toml in cwd/XDG → empty
+        // scan dirs, no error. This is the right behavior because
+        // the user didn't ask for any config; absence is expected.
+        let args = Args::parse_from(["extract"]);
+        let dirs = resolve_scan_dirs(&args).expect("implicit missing is soft-fail");
+        // Could be empty or non-empty depending on whether a real
+        // ~/.config/rledger/importers.toml exists in this test env.
+        // What we're asserting is that it didn't error.
+        let _ = dirs;
+    }
+
+    #[test]
+    fn run_dispatches_to_wasm_importer_with_config_set_but_no_toml_profiles() {
+        // End-to-end regression for the bug my earlier
+        // select_importer fix didn't fully close: a user runs
+        // `extract foo.X --config wasm-only.toml --wasm-importer my.wasm`
+        // where wasm-only.toml has *no* [[importers]] entries. The
+        // dispatcher should be the WASM module; the CSV-branch
+        // config-building must NOT fire and error out on "No
+        // importers defined". Run through run() (not just
+        // select_importer) so the dispatcher-first config-selection
+        // path is actually exercised.
+        use rustledger_importer::test_fixtures::identifying_wat;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // WAT importer that identifies every file as its own (so it
+        // wins .mt940 dispatch against the CSV fallback) and returns
+        // an empty ImporterOutput for extract.
+        let wasm_path = tmp.path().join("my.wasm");
+        std::fs::write(
+            &wasm_path,
+            wat::parse_str(identifying_wat("mt9")).expect("WAT"),
+        )
+        .unwrap();
+
+        // wasm-only.toml: sets wasm_importer_dir to nothing useful,
+        // critically has NO [[importers]] entries. Pre-fix, the CSV
+        // branch would load this and error "No importers defined".
+        let cfg_path = tmp.path().join("wasm-only.toml");
+        std::fs::write(&cfg_path, "").unwrap();
+
+        // Source file the WASM importer will be asked to handle.
+        // The actual contents don't matter — the WAT extract()
+        // returns (ptr=0, len=0) which decodes to an empty output.
+        let src_path = tmp.path().join("statement.mt940");
+        std::fs::write(&src_path, b"any bytes").unwrap();
+
+        let out_path = tmp.path().join("out.beancount");
+        let args = Args::parse_from([
+            "extract",
+            src_path.to_str().unwrap(),
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--wasm-importer",
+            wasm_path.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+        ]);
+
+        // The bug shape: run() previously errored with "No importers
+        // defined in ...". With the dispatcher-first fix, run()
+        // completes successfully and writes the empty output.
+        // (Empty msgpack from the WAT extract() decodes to an empty
+        // PluginOutput → no directives → empty .beancount file.)
+        if let Err(e) = run(&args, &src_path) {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("No importers defined"),
+                "regression: CSV-branch error fired before WASM dispatch: {msg}"
+            );
+            // Other errors (e.g. wasmtime decode of `(0, 0)`) are
+            // unrelated to the bug under test — what we're pinning
+            // is that we don't error out before reaching the WASM
+            // importer.
+        }
     }
 
     #[test]
@@ -1768,5 +2107,299 @@ filename_pattern = "statement*"
 
         let err = run(&args, &csv_path).unwrap_err();
         assert!(err.to_string().contains("No importers defined"));
+    }
+
+    // ===== build_registry / WASM discovery integration tests =====
+
+    /// Wrapper around the shared
+    /// [`rustledger_importer::test_fixtures::metadata_wat`] helper so
+    /// tests below can write WAT bytes in one call. Single source of
+    /// truth for the WAT shape lives in `rustledger-importer`; the
+    /// CLI tests just consume it.
+    fn wasm_importer_with_name(name: &str) -> Vec<u8> {
+        let wat = rustledger_importer::test_fixtures::metadata_wat(name);
+        wat::parse_str(&wat).expect("WAT parses")
+    }
+
+    #[test]
+    fn build_registry_defaults_to_builtins_only() {
+        // No --wasm-importer, no --wasm-importer-dir, no toml.
+        let args = Args::parse_from(["extract"]);
+        let registry = build_registry(&args).expect("builds");
+        // OFX + CSV.
+        assert_eq!(registry.len(), 2);
+        assert!(registry.find_by_name("CSV").is_some());
+        assert!(registry.find_by_name("OFX").is_some());
+    }
+
+    #[test]
+    fn build_registry_loads_cli_wasm_importer_ahead_of_builtins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm_path = tmp.path().join("ad-hoc.wasm");
+        std::fs::write(&wasm_path, wasm_importer_with_name("usr")).unwrap();
+
+        let args = Args::parse_from(["extract", "--wasm-importer", wasm_path.to_str().unwrap()]);
+        let registry = build_registry(&args).expect("builds");
+        // 1 user-WASM + 2 built-ins.
+        assert_eq!(registry.len(), 3);
+        assert!(registry.find_by_name("usr").is_some());
+        // Built-ins still present so CSV/OFX dispatch keeps working.
+        assert!(registry.find_by_name("CSV").is_some());
+        assert!(registry.find_by_name("OFX").is_some());
+    }
+
+    #[test]
+    fn build_registry_scans_directory_from_cli_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("aaa.wasm"), wasm_importer_with_name("aaa")).unwrap();
+        std::fs::write(tmp.path().join("bbb.wasm"), wasm_importer_with_name("bbb")).unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            "--wasm-importer-dir",
+            tmp.path().to_str().unwrap(),
+        ]);
+        let registry = build_registry(&args).expect("builds");
+        // 2 scanned + 2 built-ins.
+        assert_eq!(registry.len(), 4);
+        assert!(registry.find_by_name("aaa").is_some());
+        assert!(registry.find_by_name("bbb").is_some());
+    }
+
+    #[test]
+    fn build_registry_reads_wasm_importer_dir_from_importers_toml() {
+        // Two temp dirs: one for the .wasm modules, one for the
+        // importers.toml that points at the wasm dir.
+        let wasm_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wasm_dir.path().join("xyz.wasm"),
+            wasm_importer_with_name("xyz"),
+        )
+        .unwrap();
+
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg_path = cfg_dir.path().join("importers.toml");
+        std::fs::write(
+            &cfg_path,
+            format!("wasm_importer_dir = \"{}\"\n", wasm_dir.path().display()),
+        )
+        .unwrap();
+
+        let args = Args::parse_from(["extract", "--config", cfg_path.to_str().unwrap()]);
+        let registry = build_registry(&args).expect("builds");
+        assert!(
+            registry.find_by_name("xyz").is_some(),
+            "xyz should be loaded via importers.toml's wasm_importer_dir"
+        );
+    }
+
+    #[test]
+    fn build_registry_cli_dir_flag_overrides_importers_toml_setting() {
+        // toml setting points at a dir with 'tom.wasm'; CLI flag
+        // points at a different dir with 'cli.wasm'. Only the CLI one
+        // should load.
+        let toml_only_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            toml_only_dir.path().join("tom.wasm"),
+            wasm_importer_with_name("tom"),
+        )
+        .unwrap();
+
+        let cli_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cli_dir.path().join("cli.wasm"),
+            wasm_importer_with_name("cli"),
+        )
+        .unwrap();
+
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg_path = cfg_dir.path().join("importers.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "wasm_importer_dir = \"{}\"\n",
+                toml_only_dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "--wasm-importer-dir",
+            cli_dir.path().to_str().unwrap(),
+        ]);
+        let registry = build_registry(&args).expect("builds");
+        assert!(
+            registry.find_by_name("cli").is_some(),
+            "CLI-flag dir should be scanned"
+        );
+        assert!(
+            registry.find_by_name("tom").is_none(),
+            "toml-setting dir should be skipped when CLI flag is set"
+        );
+    }
+
+    #[test]
+    fn build_registry_propagates_cli_wasm_importer_load_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_path = tmp.path().join("bogus.wasm");
+        std::fs::write(&bad_path, b"not valid wasm").unwrap();
+
+        let args = Args::parse_from(["extract", "--wasm-importer", bad_path.to_str().unwrap()]);
+        // ImporterRegistry doesn't impl Debug, so destructure manually
+        // instead of `.expect_err`.
+        let Err(err) = build_registry(&args) else {
+            panic!("bogus wasm should fail to load");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bogus.wasm"),
+            "error should name the failing path: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_registry_scans_multiple_cli_dirs_in_order() {
+        // --wasm-importer-dir is repeatable; both dirs should be
+        // scanned, with registration order = arg order.
+        let dir_a = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir_a.path().join("aaa.wasm"),
+            wasm_importer_with_name("aaa"),
+        )
+        .unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir_b.path().join("bbb.wasm"),
+            wasm_importer_with_name("bbb"),
+        )
+        .unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            "--wasm-importer-dir",
+            dir_a.path().to_str().unwrap(),
+            "--wasm-importer-dir",
+            dir_b.path().to_str().unwrap(),
+        ]);
+        let registry = build_registry(&args).expect("builds");
+        assert!(registry.find_by_name("aaa").is_some(), "first dir loaded");
+        assert!(registry.find_by_name("bbb").is_some(), "second dir loaded");
+    }
+
+    #[test]
+    fn build_registry_accepts_toml_dir_as_list() {
+        // wasm_importer_dir = ["a", "b"] in importers.toml.
+        let dir_a = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir_a.path().join("one.wasm"),
+            wasm_importer_with_name("one"),
+        )
+        .unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir_b.path().join("two.wasm"),
+            wasm_importer_with_name("two"),
+        )
+        .unwrap();
+
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg_path = cfg_dir.path().join("importers.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "wasm_importer_dir = [\"{}\", \"{}\"]\n",
+                dir_a.path().display(),
+                dir_b.path().display()
+            ),
+        )
+        .unwrap();
+
+        let args = Args::parse_from(["extract", "--config", cfg_path.to_str().unwrap()]);
+        let registry = build_registry(&args).expect("builds");
+        assert!(registry.find_by_name("one").is_some());
+        assert!(registry.find_by_name("two").is_some());
+    }
+
+    #[test]
+    fn build_registry_skip_and_collect_loads_good_modules_past_failures() {
+        // Mix one valid and one invalid .wasm in a scanned dir. The
+        // valid one should still register; the failure is logged to
+        // stderr (not asserted here — we just check the registry
+        // didn't abort).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("good.wasm"), wasm_importer_with_name("aaa")).unwrap();
+        std::fs::write(tmp.path().join("bad-zzz.wasm"), b"not valid wasm").unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            "--wasm-importer-dir",
+            tmp.path().to_str().unwrap(),
+        ]);
+        let registry = build_registry(&args).expect("scan continues past failure");
+        assert!(
+            registry.find_by_name("aaa").is_some(),
+            "good module loaded despite sibling failure"
+        );
+    }
+
+    #[test]
+    fn build_registry_cli_wasm_importer_wins_over_dir_scanned_same_name() {
+        // Duplicate metadata.name from a CLI flag vs a scanned dir.
+        // CLI registration is first, so find_by_name returns it. The
+        // dir-scanned same-named module is also registered (both
+        // exist in the list) but unreachable via find_by_name.
+        let cli_dir = tempfile::tempdir().unwrap();
+        let cli_path = cli_dir.path().join("cli.wasm");
+        std::fs::write(&cli_path, wasm_importer_with_name("dup")).unwrap();
+
+        let scan_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            scan_dir.path().join("scanned.wasm"),
+            wasm_importer_with_name("dup"),
+        )
+        .unwrap();
+
+        let args = Args::parse_from([
+            "extract",
+            "--wasm-importer",
+            cli_path.to_str().unwrap(),
+            "--wasm-importer-dir",
+            scan_dir.path().to_str().unwrap(),
+        ]);
+        let registry = build_registry(&args).expect("builds");
+        // Both registered.
+        assert_eq!(registry.len(), 4, "1 CLI + 1 dir-scanned + 2 builtins");
+        // CLI one wins find_by_name because it's first.
+        assert!(registry.find_by_name("dup").is_some());
+        // Two entries with the same name in list_importers.
+        let dup_count = registry
+            .list_importers()
+            .iter()
+            .filter(|(name, _)| *name == "dup")
+            .count();
+        assert_eq!(dup_count, 2, "both same-named modules are registered");
+    }
+
+    #[test]
+    fn expand_tilde_resolves_tilde_prefix() {
+        use super::config::expand_tilde;
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expand_tilde(Path::new("~")), home);
+            assert_eq!(
+                expand_tilde(Path::new("~/foo/bar")),
+                home.join("foo").join("bar")
+            );
+        }
+        // No leading tilde → identity.
+        assert_eq!(expand_tilde(Path::new("/abs/path")), Path::new("/abs/path"));
+        assert_eq!(expand_tilde(Path::new("rel/path")), Path::new("rel/path"));
+        // ~user is not supported — left as-is.
+        assert_eq!(
+            expand_tilde(Path::new("~other/foo")),
+            Path::new("~other/foo")
+        );
     }
 }
