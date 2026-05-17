@@ -28,8 +28,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use wasmtime::{Config, Engine, Linker, Module, Store};
+use wasmtime::{Engine, Linker, Module};
 
+use crate::sandbox;
 use crate::types::{DirectiveWrapper, PluginInput, PluginOp, PluginOutput};
 
 /// Materialize a plugin's `ops` against its input directive list,
@@ -57,11 +58,20 @@ fn materialize_ops(input: &[DirectiveWrapper], output: &PluginOutput) -> Vec<Dir
 }
 
 /// Configuration for the plugin runtime.
+///
+/// **Applied at `Plugin::execute` time, not at load.** `Plugin::load`
+/// and `Plugin::load_bytes` accept a `&RuntimeConfig` for API
+/// symmetry but ignore it — only the per-call execution caps
+/// (`max_memory`, `max_time_secs`) are meaningful, and those flow
+/// into the per-`Store` setup that `execute` builds.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    /// Maximum memory in bytes (default: 256MB).
+    /// Maximum memory in bytes (default: 256MB). Enforced at
+    /// `Plugin::execute` via [`crate::sandbox::make_sandboxed_store`].
     pub max_memory: usize,
-    /// Maximum execution time in seconds (default: 30).
+    /// Maximum execution time in seconds (default: 30). Clamped to
+    /// `≥1` and `saturating_mul`'d to fuel units; see
+    /// [`crate::sandbox::make_sandboxed_store`].
     pub max_time_secs: u64,
 }
 
@@ -85,9 +95,21 @@ impl Default for RuntimeConfig {
 /// Returns an error if the module has forbidden imports or is missing
 /// required exports.
 pub fn validate_plugin_module(bytes: &[u8]) -> Result<()> {
-    let engine = Engine::default();
+    // Use the workspace sandbox config — same feature flags the
+    // runtime applies at load. Otherwise `validate_plugin_module`
+    // could say "Ok" against vanilla wasmtime features but the
+    // actual `Plugin::load_bytes` would reject the same module
+    // because (e.g.) it uses `wasm_threads`.
+    let engine = Engine::new(&sandbox::sandbox_config())?;
     let module = Module::new(&engine, bytes)?;
+    validate_loaded_module(&module)
+}
 
+/// Inner validator that operates on an already-compiled [`Module`].
+/// Used by both [`validate_plugin_module`] (the public bytes-taking
+/// helper) and `Plugin::load`/`load_bytes` so the module is only
+/// compiled once during load instead of twice.
+fn validate_loaded_module(module: &Module) -> Result<()> {
     // Check for forbidden imports (any imports are forbidden)
     if let Some(import) = module.imports().next() {
         anyhow::bail!(
@@ -132,11 +154,11 @@ impl Plugin {
             .unwrap_or("unknown")
             .to_string();
 
-        // Create engine with configuration
-        let mut engine_config = Config::new();
-        engine_config.consume_fuel(true); // Enable fuel for execution limits
-
-        let engine = Arc::new(Engine::new(&engine_config)?);
+        // Process-wide shared engine with the workspace's locked-down
+        // wasm-feature config (see `sandbox::sandbox_config` for the
+        // list). One Engine per process amortizes JIT/cache cost
+        // across all loaded plugins.
+        let engine = sandbox::shared_engine();
 
         // Load and compile the module
         let wasm_bytes =
@@ -144,7 +166,13 @@ impl Plugin {
 
         let module = Module::new(&engine, &wasm_bytes)
             .map_err(anyhow::Error::from)
-            .with_context(|| format!("failed to compile {}", path.display()))?;
+            .with_context(|| format!("invalid plugin {}", path.display()))?;
+
+        // Validate imports + required exports at load time so failures
+        // surface here (with a clear "must export" message) rather than
+        // deeper in `execute()` where they look like signature mismatches.
+        validate_loaded_module(&module)
+            .with_context(|| format!("invalid plugin {}", path.display()))?;
 
         Ok(Self {
             name,
@@ -160,12 +188,13 @@ impl Plugin {
         _config: &RuntimeConfig,
     ) -> Result<Self> {
         let name = name.into();
-
-        let mut engine_config = Config::new();
-        engine_config.consume_fuel(true);
-
-        let engine = Arc::new(Engine::new(&engine_config)?);
-        let module = Module::new(&engine, bytes)?;
+        let engine = sandbox::shared_engine();
+        let module = Module::new(&engine, bytes)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("invalid plugin `{name}`"))?;
+        // Same load-time validation as `load` — see that method's
+        // comment for rationale.
+        validate_loaded_module(&module).with_context(|| format!("invalid plugin `{name}`"))?;
 
         Ok(Self {
             name,
@@ -181,12 +210,14 @@ impl Plugin {
 
     /// Execute the plugin with the given input.
     pub fn execute(&self, input: &PluginInput, config: &RuntimeConfig) -> Result<PluginOutput> {
-        // Create a store with fuel limit
-        let mut store = Store::new(&self.engine, ());
-
-        // Set fuel limit based on time (rough approximation: 1M instructions per second)
-        let fuel = config.max_time_secs * 1_000_000;
-        store.set_fuel(fuel)?;
+        // Workspace-shared sandboxed store: wires the MemoryLimiter
+        // (enforcing `config.max_memory` on initial allocation +
+        // `memory.grow`) and the fuel budget (clamped ≥1 + saturating
+        // to avoid zero-fuel starvation and u64 overflow). Mirrors the
+        // WASM importer host so per-call enforcement is consistent
+        // across the workspace.
+        let mut store =
+            sandbox::make_sandboxed_store(&self.engine, config.max_memory, config.max_time_secs)?;
 
         // Create linker with NO imports for full sandboxing
         // Plugins have no access to filesystem, network, or any system calls
@@ -198,16 +229,23 @@ impl Plugin {
         // Serialize input
         let input_bytes = rmp_serde::to_vec(input)?;
 
-        // Get memory and allocate space for input
+        // `validate_loaded_module` proved `memory` presence at load
+        // time — an absent export here is unreachable in practice.
         let memory = instance
             .get_memory(&mut store, "memory")
-            .ok_or_else(|| anyhow::anyhow!("plugin must export 'memory'"))?;
+            .expect("validate_loaded_module verified `memory` export at load");
 
-        // Get the alloc function to allocate space in WASM memory
+        // Same reasoning: presence is guaranteed by load-time
+        // validation, so any `get_typed_func` failure here is a
+        // signature mismatch (e.g. plugin declared `alloc(i64) -> i64`
+        // instead of `alloc(u32) -> u32`), not absence.
         let alloc = instance
             .get_typed_func::<u32, u32>(&mut store, "alloc")
             .map_err(anyhow::Error::from)
-            .context("plugin must export 'alloc' function")?;
+            // wasmtime's error already names the expected vs found
+            // signature — our context just labels what was being
+            // looked up. Avoids drift if the ABI ever changes.
+            .context("plugin export `alloc` has wrong signature")?;
 
         // Allocate space for input
         let input_ptr = alloc.call(&mut store, input_bytes.len() as u32)?;
@@ -219,7 +257,7 @@ impl Plugin {
         let process = instance
             .get_typed_func::<(u32, u32), u64>(&mut store, "process")
             .map_err(anyhow::Error::from)
-            .context("plugin must export 'process' function")?;
+            .context("plugin export `process` has wrong signature")?;
 
         let result = process.call(&mut store, (input_ptr, input_bytes.len() as u32))?;
 
@@ -565,6 +603,7 @@ impl Default for WatchingPluginManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PluginOptions;
 
     /// Test that a minimal valid WASM module passes validation.
     ///
@@ -989,5 +1028,207 @@ mod tests {
         let empty: &[u8] = &[];
         let result = validate_plugin_module(empty);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn execute_rejects_initial_memory_above_max_memory_cap() {
+        // Plugin declares 5000 pages (320 MiB) initial memory.
+        // With max_memory = 64 MiB, instantiation inside execute()
+        // must fail via the MemoryLimiter wired by
+        // `sandbox::make_sandboxed_store`. Pins the equivalent of
+        // the importer's `initial_memory_above_cap_is_rejected_via_limiter_wiring`
+        // test for the plugin runtime path — proves the per-Store
+        // limiter is actually applied here, not just in the importer.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (memory (export "memory") 5000)
+                (func (export "alloc") (param i32) (result i32) i32.const 0)
+                (func (export "process") (param i32 i32) (result i64) i64.const 0)
+            )
+            "#,
+        )
+        .expect("WAT parses");
+        let plugin = Plugin::load_bytes("bigmem", &wasm, &RuntimeConfig::default())
+            .expect("module loads (declared memory size is checked at instantiate, not compile)");
+        let tight_config = RuntimeConfig {
+            max_memory: 64 * 1024 * 1024,
+            max_time_secs: 30,
+        };
+        let input = PluginInput {
+            directives: vec![],
+            options: PluginOptions {
+                operating_currencies: vec![],
+                title: None,
+            },
+            config: None,
+        };
+        let err = plugin
+            .execute(&input, &tight_config)
+            .expect_err("instantiation should fail when initial memory > cap");
+        // Check for one of the keywords wasmtime uses when a
+        // ResourceLimiter rejects allocation. Wording varies across
+        // versions, but at least one of these tokens has appeared
+        // in every release we've targeted, so this catches a
+        // truly-silent failure (e.g. limiter not wired) while
+        // tolerating message rephrasings.
+        let msg = format!("{err:#}").to_ascii_lowercase();
+        assert!(
+            msg.contains("memory") || msg.contains("limit"),
+            "expected memory-limit error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn execute_surfaces_wrong_signature_on_alloc() {
+        // Plugin has `alloc(i64) -> i64` instead of the required
+        // `alloc(u32) -> u32`. Presence check (validate_loaded_module)
+        // passes — the export is there. The signature mismatch
+        // surfaces inside `execute()` with the new "wrong signature"
+        // context. Pre-PR this would have read "plugin must export
+        // 'alloc' function" — misleading, since it DOES export it.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "alloc") (param i64) (result i64) i64.const 0)
+                (func (export "process") (param i32 i32) (result i64) i64.const 0)
+            )
+            "#,
+        )
+        .expect("WAT parses");
+        let plugin = Plugin::load_bytes("bad-alloc-sig", &wasm, &RuntimeConfig::default())
+            .expect("module loads (validate only checks presence by name)");
+        let input = PluginInput {
+            directives: vec![],
+            options: PluginOptions {
+                operating_currencies: vec![],
+                title: None,
+            },
+            config: None,
+        };
+        let err = plugin
+            .execute(&input, &RuntimeConfig::default())
+            .expect_err("wrong-sig alloc should fail execute");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("alloc") && msg.contains("wrong signature"),
+            "expected `alloc` + `wrong signature` in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn execute_surfaces_wrong_signature_on_process() {
+        // Symmetric to the `alloc` sibling: `process` is declared
+        // as `(i32, i32) -> i32` instead of `(u32, u32) -> u64`.
+        // Presence check passes; signature mismatch surfaces with
+        // the new "wrong signature" context.
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "alloc") (param i32) (result i32) i32.const 0)
+                (func (export "process") (param i32 i32) (result i32) i32.const 0)
+            )
+            "#,
+        )
+        .expect("WAT parses");
+        let plugin = Plugin::load_bytes("bad-process-sig", &wasm, &RuntimeConfig::default())
+            .expect("module loads (validate only checks presence by name)");
+        let input = PluginInput {
+            directives: vec![],
+            options: PluginOptions {
+                operating_currencies: vec![],
+                title: None,
+            },
+            config: None,
+        };
+        let err = plugin
+            .execute(&input, &RuntimeConfig::default())
+            .expect_err("wrong-sig process should fail execute");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("process") && msg.contains("wrong signature"),
+            "expected `process` + `wrong signature` in error, got: {msg}"
+        );
+    }
+
+    /// Minimal passthrough WAT used by the fuel-clamp tests below.
+    /// `process` returns `(ptr=0, len=0)` which deserializes to an
+    /// empty `PluginOutput` — enough to exercise the full fuel path.
+    fn passthrough_wat() -> &'static str {
+        r#"
+        (module
+            (memory (export "memory") 1)
+            (func (export "alloc") (param i32) (result i32) i32.const 0)
+            (func (export "process") (param i32 i32) (result i64) i64.const 0)
+        )
+        "#
+    }
+
+    fn empty_input() -> PluginInput {
+        PluginInput {
+            directives: vec![],
+            options: PluginOptions {
+                operating_currencies: vec![],
+                title: None,
+            },
+            config: None,
+        }
+    }
+
+    /// Assert that the error from a passthrough-WAT `execute` is the
+    /// expected msgpack-decode failure (the WAT returns
+    /// `(ptr=0, len=0)`, which can't parse as `PluginOutput`) and not
+    /// a fuel-exhaustion trap.
+    ///
+    /// Reaching the decode step proves WASM execution completed —
+    /// any fuel-starvation bug would have trapped before then.
+    fn assert_not_fuel_trap(err: &anyhow::Error) {
+        let msg = format!("{err:#}").to_ascii_lowercase();
+        assert!(
+            !msg.contains("fuel") && !msg.contains("trap"),
+            "expected msgpack decode error, got fuel/trap: {msg}"
+        );
+    }
+
+    #[test]
+    fn execute_with_zero_max_time_secs_clamps_to_min_fuel() {
+        // Regression for the fuel-calc bug fix that landed via
+        // `make_sandboxed_store`. Pre-PR, `max_time_secs = 0` caused
+        // immediate fuel-exhaustion trap on first instruction. Now
+        // clamped to ≥1 second of fuel by the shared helper.
+        // Proves the plugin runtime gets the fix, not just the
+        // importer.
+        let wasm = wat::parse_str(passthrough_wat()).expect("WAT parses");
+        let plugin =
+            Plugin::load_bytes("fuel-zero", &wasm, &RuntimeConfig::default()).expect("loads");
+        let zero_secs = RuntimeConfig {
+            max_memory: 256 * 1024 * 1024,
+            max_time_secs: 0,
+        };
+        let err = plugin
+            .execute(&empty_input(), &zero_secs)
+            .expect_err("passthrough WAT decode-fails by design");
+        assert_not_fuel_trap(&err);
+    }
+
+    #[test]
+    fn execute_with_max_max_time_secs_saturates_fuel() {
+        // Regression for the saturating_mul fix. Pre-PR, max_time_secs
+        // = u64::MAX would panic in debug and silently wrap in
+        // release. Now saturates to u64::MAX fuel via the shared
+        // helper.
+        let wasm = wat::parse_str(passthrough_wat()).expect("WAT parses");
+        let plugin =
+            Plugin::load_bytes("fuel-max", &wasm, &RuntimeConfig::default()).expect("loads");
+        let max_secs = RuntimeConfig {
+            max_memory: 256 * 1024 * 1024,
+            max_time_secs: u64::MAX,
+        };
+        let err = plugin
+            .execute(&empty_input(), &max_secs)
+            .expect_err("passthrough WAT decode-fails by design");
+        assert_not_fuel_trap(&err);
     }
 }
