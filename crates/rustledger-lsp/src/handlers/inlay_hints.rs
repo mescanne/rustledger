@@ -7,7 +7,8 @@
 //! Supports resolve for lazy-loading rich tooltips with account details.
 
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Position};
-use rustledger_core::{Decimal, Directive, SYNTHESIZED_FILE_ID};
+use rustledger_booking::interpolate;
+use rustledger_core::{Decimal, Directive, IncompleteAmount, SYNTHESIZED_FILE_ID};
 use rustledger_parser::ParseResult;
 use std::collections::HashMap;
 
@@ -20,72 +21,168 @@ pub fn handle_inlay_hints(
     parse_result: &ParseResult,
 ) -> Option<Vec<InlayHint>> {
     let range = params.range;
-    let uri = params.text_document.uri.as_str();
     let mut hints = Vec::new();
-    let lines: Vec<&str> = source.lines().collect();
     // Build the line index once: O(n) up front, O(log lines) per
     // offset lookup. Without it the per-directive + per-posting
-    // lookups below scale quadratically with file size.
+    // lookups below scale quadratically with file size. We also
+    // use `line_index.line_text(...)` further down instead of
+    // pre-collecting `Vec<&str>` of all lines, so a large fully-
+    // explicit ledger pays neither allocation.
     let line_index = LineIndex::new(source);
 
     for spanned in &parse_result.directives {
-        if let Directive::Transaction(txn) = &spanned.value {
-            let (start_line, _) = line_index.offset_to_position(spanned.span.start);
+        let Directive::Transaction(txn) = &spanned.value else {
+            continue;
+        };
+        // Skip transactions that fall entirely outside the
+        // requested range, in either direction. `span.end` is
+        // exclusive (byte after the directive), so an `end_line <
+        // range.start.line` test cleanly excludes "directive ended
+        // before the visible range started".
+        let (start_line, _) = line_index.offset_to_position(spanned.span.start);
+        let (end_line, _) = line_index.offset_to_position(spanned.span.end);
+        if start_line > range.end.line || end_line < range.start.line {
+            continue;
+        }
 
-            // Skip if transaction is outside the requested range
-            if start_line > range.end.line {
+        // Fast path: a transaction with no fully-missing postings
+        // has no inferred-amount hint to emit, and there's no point
+        // running the interpolator (which clones the transaction
+        // internally). The common case is fully-explicit
+        // transactions, so this gate is a meaningful win on large
+        // files where inlay hints are recomputed on every keystroke.
+        //
+        // We gate on `units.is_none()` rather than "any non-Complete"
+        // because the inlay-hint UX only renders for fully-missing
+        // postings — see the filter further down.
+        if !txn.postings.iter().any(|p| p.units.is_none()) {
+            continue;
+        }
+
+        // Delegate inference to the canonical booking interpolator.
+        // The previous bespoke implementation (`calculate_inferred_amount`)
+        // only handled the simplest case (exactly one missing posting,
+        // exactly one currency) — multi-currency transactions and
+        // postings with cost specs silently emitted zero hints.
+        //
+        // `InterpolationError` (e.g. MultipleMissing, unbalanced) is
+        // silently dropped: no hints for an under-specified
+        // transaction is the right outcome.
+        let Ok(filled) = interpolate(txn) else {
+            continue;
+        };
+
+        // Walk SOURCE postings (not `filled.filled_indices`) and
+        // locate each fill by matching span. Three properties fall
+        // out of this design:
+        //
+        // 1. **Source-order, deterministic output.** The
+        //    interpolator's `filled_indices` is built from
+        //    HashMap-driven iteration whose order is unspecified;
+        //    walking source postings gives a stable order the
+        //    client can rely on.
+        //
+        // 2. **Naturally restricts to fully-missing postings.**
+        //    `NumberOnly`/`CurrencyOnly` source postings already
+        //    display one half on screen, so appending the other
+        //    half at line-end would visually duplicate the typed
+        //    text (`Assets:Cash USD  -50.00 USD`) or wrongly order
+        //    number-then-currency. The bespoke pre-refactor
+        //    implementation only emitted hints for fully-missing
+        //    postings, and we deliberately preserve that UX.
+        //
+        // 3. **Sidesteps prune-shift bugs.** Interpolate's prune
+        //    step removes zero-amount fills from
+        //    `result.postings`, which shifts subsequent fills'
+        //    positions; `filled_indices` is then result-relative,
+        //    not source-relative. A reachable case is e.g. a
+        //    `CurrencyOnly` posting whose currency's residual is
+        //    already zero — interpolate fills with 0 and prunes,
+        //    shifting later fills. Matching by span — preserved
+        //    across `interpolate`'s clone — works regardless of
+        //    pruning and shifting.
+        for source_posting in &txn.postings {
+            if source_posting.units.is_some() {
+                continue;
+            }
+            if source_posting.file_id == SYNTHESIZED_FILE_ID {
                 continue;
             }
 
-            // Calculate the inferred amount for postings without amounts
-            let inferred = calculate_inferred_amount(txn);
-
-            // Per-posting span lookup (see #1142): the prior
-            // `start_line + 1 + i` arithmetic put hints on the wrong
-            // line for transactions with interleaved metadata.
-            for spanned_posting in &txn.postings {
-                if spanned_posting.file_id == SYNTHESIZED_FILE_ID {
-                    continue;
-                }
-                let posting = &**spanned_posting;
-                let (posting_line, _) = line_index.offset_to_position(spanned_posting.span.start);
-
-                // Skip if outside range
-                if posting_line < range.start.line || posting_line > range.end.line {
-                    continue;
-                }
-
-                // Only show hint for postings without explicit amount
-                if posting.units.is_none()
-                    && let Some((amount, currency)) = &inferred
-                    && let Some(line) = lines.get(posting_line as usize)
-                {
-                    // Position hint at the end of the account name
-                    let trimmed = line.trim();
-                    let indent = line.len() - line.trim_start().len();
-                    let end_col = indent + trimmed.len();
-
-                    // Store data for resolve - include account for rich tooltip
-                    let data = serde_json::json!({
-                        "uri": uri,
-                        "kind": "inferred_amount",
-                        "account": posting.account.to_string(),
-                        "amount": amount.to_string(),
-                        "currency": currency,
-                    });
-
-                    hints.push(InlayHint {
-                        position: Position::new(posting_line, end_col as u32),
-                        label: InlayHintLabel::String(format!("  {} {}", amount, currency)),
-                        kind: Some(InlayHintKind::TYPE),
-                        text_edits: None,
-                        tooltip: None, // Resolved lazily
-                        padding_left: Some(true),
-                        padding_right: None,
-                        data: Some(data),
-                    });
-                }
+            let (posting_line, _) = line_index.offset_to_position(source_posting.span.start);
+            if posting_line < range.start.line || posting_line > range.end.line {
+                continue;
             }
+
+            // Match the filled version of this source posting by
+            // span. `interpolate` clones source postings and
+            // preserves their spans, so byte-offset equality
+            // identifies the same posting reliably. If no match —
+            // the slot filled to zero and got pruned — emit no
+            // hint.
+            //
+            // Note on the multi-currency single-missing case:
+            // `interpolate` fills the source posting with the FIRST
+            // residual currency in place, then appends additional
+            // posting clones (one per remaining currency, each
+            // carrying the SAME span as the template). `find()`
+            // returns the in-place fill — so we emit one hint
+            // covering only the first currency. Surfacing the
+            // others would require either a multi-line hint layout
+            // or stacking hints at the same screen position; we
+            // accept the single-currency rendering to match the
+            // pre-refactor bespoke implementation.
+            let Some(filled_posting) = filled
+                .transaction
+                .postings
+                .iter()
+                .find(|p| p.span.start == source_posting.span.start)
+            else {
+                continue;
+            };
+
+            let Some(IncompleteAmount::Complete(amount)) = &filled_posting.units else {
+                debug_assert!(
+                    false,
+                    "interpolate: fully-missing source posting did not fill to Complete: {:?}",
+                    filled_posting.units
+                );
+                continue;
+            };
+
+            let Some(line) = line_index.line_text(source, posting_line) else {
+                continue;
+            };
+
+            // Position the hint at the end of the trimmed line
+            // content. We only reach this point for fully-missing
+            // source postings (the filter above), so a well-formed
+            // posting line is `[indent][flag ]account[trailing ws]`
+            // — `indent + trimmed.len()` lands right after the
+            // account (or `flag account` if a flag is present),
+            // which is where the inferred amount visually belongs.
+            let trimmed = line.trim();
+            let indent = line.len() - line.trim_start().len();
+            let end_col = indent + trimmed.len();
+
+            // Store data for resolve - include account for rich tooltip
+            let data = serde_json::json!({
+                "kind": "inferred_amount",
+                "account": source_posting.account.to_string(),
+                "amount": amount.number.to_string(),
+                "currency": amount.currency.to_string(),
+            });
+
+            hints.push(InlayHint {
+                position: Position::new(posting_line, end_col as u32),
+                label: InlayHintLabel::String(format!("  {} {}", amount.number, amount.currency)),
+                kind: Some(InlayHintKind::TYPE),
+                text_edits: None,
+                tooltip: None, // Resolved lazily
+                padding_left: Some(true),
+                padding_right: None,
+                data: Some(data),
+            });
         }
     }
 
@@ -165,33 +262,6 @@ fn build_account_tooltip(
     tooltip
 }
 
-/// Calculate the inferred amount for a transaction with one empty posting.
-fn calculate_inferred_amount(txn: &rustledger_core::Transaction) -> Option<(Decimal, String)> {
-    // Count postings with and without amounts
-    let mut amounts_by_currency: HashMap<String, Decimal> = HashMap::new();
-    let mut empty_posting_count = 0;
-
-    for posting in &txn.postings {
-        if let Some(ref units) = posting.units {
-            if let (Some(num), Some(curr)) = (units.number(), units.currency()) {
-                let currency = curr.to_string();
-                *amounts_by_currency.entry(currency).or_insert(Decimal::ZERO) += num;
-            }
-        } else {
-            empty_posting_count += 1;
-        }
-    }
-
-    // Only infer if exactly one posting has no amount and we have a single currency
-    if empty_posting_count == 1 && amounts_by_currency.len() == 1 {
-        let (currency, total) = amounts_by_currency.into_iter().next()?;
-        // The inferred amount is the negation of the sum
-        Some((-total, currency))
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,26 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_inferred_amount() {
-        let source = r#"2024-01-15 * "Test"
-  Assets:Bank  -10.00 USD
-  Expenses:Food
-"#;
-        let result = parse(source);
-
-        if let Some(spanned) = result.directives.first()
-            && let Directive::Transaction(txn) = &spanned.value
-        {
-            let inferred = calculate_inferred_amount(txn);
-            assert!(inferred.is_some());
-
-            let (amount, currency) = inferred.unwrap();
-            assert_eq!(amount, Decimal::new(1000, 2)); // 10.00
-            assert_eq!(currency, "USD");
-        }
-    }
-
-    #[test]
     fn test_inlay_hint_resolve() {
         let source = r#"2024-01-15 * "Coffee"
   Assets:Bank  -5.00 USD
@@ -278,13 +328,15 @@ mod tests {
 
         let resolved = handle_inlay_hint_resolve(hint, &result);
 
-        // Should now have a tooltip
-        assert!(resolved.tooltip.is_some());
-
-        if let Some(lsp_types::InlayHintTooltip::MarkupContent(content)) = resolved.tooltip {
-            assert!(content.value.contains("Expenses:Food"));
-            assert!(content.value.contains("2 transactions"));
-        }
+        // Pattern-match the variant explicitly: a `String` tooltip
+        // (the other variant) would silently pass the prior
+        // `if let Some(MarkupContent(_))` pattern.
+        let content = match resolved.tooltip {
+            Some(lsp_types::InlayHintTooltip::MarkupContent(c)) => c,
+            other => panic!("expected MarkupContent tooltip; got {other:?}"),
+        };
+        assert!(content.value.contains("Expenses:Food"));
+        assert!(content.value.contains("2 transactions"));
     }
 
     #[test]
@@ -384,6 +436,191 @@ mod tests {
         assert_eq!(
             hints[0].position.line, 3,
             "inferred-amount hint should be on the posting line, not the metadata line"
+        );
+    }
+
+    /// Multi-currency transactions used to get NO inferred-amount
+    /// hints at all: the bespoke `calculate_inferred_amount` bailed
+    /// the moment more than one currency was seen, even when each
+    /// currency had exactly one missing posting (a perfectly
+    /// inferable case). Delegating to `rustledger_booking::interpolate`
+    /// produces a hint per inferred posting, including the
+    /// multi-currency case below.
+    #[test]
+    fn test_inlay_hints_multi_currency_inference() {
+        let source = "\
+2024-01-15 * \"FX swap\"
+  Assets:Bank:USD  100.00 USD
+  Assets:Bank:EUR  -90.00 EUR
+  Expenses:Fees:USD
+  Expenses:Fees:EUR
+";
+        let result = parse(source);
+        assert!(
+            result.errors.is_empty(),
+            "parse errors: {:?}",
+            result.errors
+        );
+
+        let params = InlayHintParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: "file:///test.beancount".parse().unwrap(),
+            },
+            range: lsp_types::Range {
+                start: Position::new(0, 0),
+                end: Position::new(10, 0),
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let hints = handle_inlay_hints(&params, source, &result).unwrap_or_default();
+
+        // Both empty postings should get a hint, with the correct
+        // per-currency residual. Pre-refactor: zero hints (multi-
+        // currency was bailed entirely).
+        assert_eq!(
+            hints.len(),
+            2,
+            "expected one hint per inferred posting; got {hints:?}"
+        );
+
+        // Labels carry the (sign-flipped) residual + currency. The
+        // expected residuals are -100 USD (negating the +100 USD
+        // explicit posting) and +90 EUR (negating -90 EUR).
+        let labels: Vec<String> = hints
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.contains("-100") && l.contains("USD")),
+            "expected a hint showing -100 USD; got labels = {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("90") && l.contains("EUR")),
+            "expected a hint showing 90 EUR; got labels = {labels:?}"
+        );
+    }
+
+    /// `NumberOnly` source postings already display the typed
+    /// digits on the posting line. The interpolator can still fill
+    /// the currency (e.g., from another posting's units residual),
+    /// but appending `  -5000.00 USD` after `-5000.00` would
+    /// duplicate the number on screen. The LSP suppresses the
+    /// hint; the bespoke pre-refactor implementation did the same.
+    ///
+    /// This test specifically exercises a transaction where
+    /// `interpolate` SUCCEEDS and fills the `NumberOnly` slot —
+    /// pinning the filter (not bypass-by-error).
+    #[test]
+    fn test_inlay_hints_skip_number_only_posting() {
+        let source = "\
+2024-01-15 * \"Paycheck\"
+  Assets:Bank  5000 USD
+  Income:Salary  -5000
+";
+        let result = parse(source);
+        assert!(
+            result.errors.is_empty(),
+            "parse errors: {:?}",
+            result.errors
+        );
+
+        // Verify the precondition: `interpolate` succeeds and fills
+        // the `NumberOnly` slot. Without this, the no-hints assertion
+        // below could pass via bypass-by-Err (a non-issue for THIS
+        // input, but documenting the requirement).
+        let txn = match &result.directives[0].value {
+            Directive::Transaction(t) => t,
+            _ => unreachable!(),
+        };
+        let interp = interpolate(txn).expect("interpolate should succeed");
+        let salary_posting = interp
+            .transaction
+            .postings
+            .iter()
+            .find(|p| p.account.as_ref() == "Income:Salary")
+            .expect("Income:Salary should be present after interpolation");
+        assert!(
+            matches!(&salary_posting.units, Some(IncompleteAmount::Complete(_))),
+            "interpolate must have filled NumberOnly to Complete; got {:?}",
+            salary_posting.units
+        );
+
+        let params = InlayHintParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: "file:///test.beancount".parse().unwrap(),
+            },
+            range: lsp_types::Range {
+                start: Position::new(0, 0),
+                end: Position::new(10, 0),
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let hints = handle_inlay_hints(&params, source, &result);
+        assert!(
+            hints.is_none() || hints.as_ref().unwrap().is_empty(),
+            "no hint expected for NumberOnly source posting; got {hints:?}"
+        );
+    }
+
+    /// Same UX invariant as the `NumberOnly` test above, applied to
+    /// `CurrencyOnly` (typed `USD`, missing number). Appending the
+    /// inferred amount at line-end would render as
+    /// `Assets:Cash USD  -50.00 USD` — duplicate currency, wrong
+    /// number-then-currency order. The LSP suppresses the hint.
+    #[test]
+    fn test_inlay_hints_skip_currency_only_posting() {
+        let source = "\
+2024-01-15 * \"Coffee\"
+  Assets:Bank  -5.00 USD
+  Expenses:Food USD
+";
+        let result = parse(source);
+        assert!(
+            result.errors.is_empty(),
+            "parse errors: {:?}",
+            result.errors
+        );
+
+        // Precondition: interpolate succeeds and fills CurrencyOnly.
+        let txn = match &result.directives[0].value {
+            Directive::Transaction(t) => t,
+            _ => unreachable!(),
+        };
+        let interp = interpolate(txn).expect("interpolate should succeed");
+        let food_posting = interp
+            .transaction
+            .postings
+            .iter()
+            .find(|p| p.account.as_ref() == "Expenses:Food")
+            .expect("Expenses:Food should be present after interpolation");
+        assert!(
+            matches!(&food_posting.units, Some(IncompleteAmount::Complete(_))),
+            "interpolate must have filled CurrencyOnly to Complete; got {:?}",
+            food_posting.units
+        );
+
+        let params = InlayHintParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: "file:///test.beancount".parse().unwrap(),
+            },
+            range: lsp_types::Range {
+                start: Position::new(0, 0),
+                end: Position::new(10, 0),
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let hints = handle_inlay_hints(&params, source, &result);
+        assert!(
+            hints.is_none() || hints.as_ref().unwrap().is_empty(),
+            "no hint expected for CurrencyOnly source posting; got {hints:?}"
         );
     }
 }
