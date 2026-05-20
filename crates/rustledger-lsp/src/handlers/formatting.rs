@@ -6,19 +6,38 @@
 //! - Consistent spacing around operators
 
 use lsp_types::{DocumentFormattingParams, Position, Range, TextEdit};
-use rustledger_core::{Directive, SYNTHESIZED_FILE_ID};
+use rustledger_core::{Directive, FormatConfig, SYNTHESIZED_FILE_ID, format_posting_line};
 use rustledger_parser::ParseResult;
 
-use super::utils::LineIndex;
+use super::utils::{LineIndex, document_format_config};
 
-/// Default column for amount alignment.
-const AMOUNT_COLUMN: usize = 50;
-
-/// Handle a document formatting request.
+/// Handle a `textDocument/formatting` request.
+///
+/// Thin LSP-shaped wrapper around [`format_document`]. The protocol
+/// passes client `FormattingOptions` here; this function feeds them
+/// to [`document_format_config`] for the actual `FormatConfig`.
 pub fn handle_formatting(
-    _params: &DocumentFormattingParams,
+    params: &DocumentFormattingParams,
     source: &str,
     parse_result: &ParseResult,
+) -> Option<Vec<TextEdit>> {
+    let config = document_format_config(Some(&params.options));
+    format_document(source, parse_result, &config)
+}
+
+/// Compute the document-format edits for a parsed source with a
+/// resolved [`FormatConfig`].
+///
+/// Both `textDocument/formatting` (via [`handle_formatting`]) and
+/// `rledger.alignAmounts` (via `handle_align_amounts`) call into
+/// this — separated from the LSP-shaped wrapper so the executeCommand
+/// path can express its config source explicitly (`None` → server
+/// defaults) rather than synthesizing a fake `DocumentFormattingParams`
+/// just to reach the formatter.
+pub fn format_document(
+    source: &str,
+    parse_result: &ParseResult,
+    config: &FormatConfig,
 ) -> Option<Vec<TextEdit>> {
     let mut edits = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
@@ -45,7 +64,8 @@ pub fn handle_formatting(
                 }
                 let (posting_line, _) = line_index.offset_to_position(spanned_posting.span.start);
                 if let Some(line) = lines.get(posting_line as usize)
-                    && let Some(edit) = format_posting_line(line, posting_line, spanned_posting)
+                    && let Some(edit) =
+                        posting_text_edit(line, posting_line, spanned_posting, config)
                 {
                     edits.push(edit);
                 }
@@ -95,11 +115,27 @@ pub fn handle_formatting(
     if edits.is_empty() { None } else { Some(edits) }
 }
 
-/// Format a posting line for alignment.
-fn format_posting_line(
+/// Compute a posting-line `TextEdit` by delegating to the canonical
+/// core formatter ([`rustledger_core::format_posting_line`]). The
+/// previous hand-rolled implementation here had two latent problems
+/// fixed by the unification:
+///
+/// - It hardcoded `AMOUNT_COLUMN = 50`, so the LSP produced output one
+///   column shy of `rledger format`'s default 60.
+/// - It only formatted account + units, silently dropping cost specs
+///   (`{...}`) and price annotations (`@`/`@@`).
+///
+/// `format_posting_line` is also the unit the on-disk formatter emits
+/// (it's reused inside `format_transaction`), so any TextEdit we emit
+/// matches exactly what `rledger format` would write to disk —
+/// **including the first same-line trailing comment**. An earlier
+/// draft delegated to the lower-level `format_posting`, which omitted
+/// the comment and would have produced edits that silently dropped it.
+fn posting_text_edit(
     line: &str,
     line_num: u32,
     posting: &rustledger_core::Posting,
+    config: &FormatConfig,
 ) -> Option<TextEdit> {
     let trimmed = line.trim();
 
@@ -108,67 +144,21 @@ fn format_posting_line(
         return None;
     }
 
-    // Parse the line to find account and amount positions
-    let account = posting.account.to_string();
+    let formatted = format_posting_line(posting, config);
 
-    // Check if line starts with proper indentation
-    let current_indent = line.len() - line.trim_start().len();
-    let expected_indent = 2;
-
-    // Build the formatted line
-    let mut formatted = String::new();
-
-    // Add indentation
-    formatted.push_str(&" ".repeat(expected_indent));
-
-    // Add account
-    formatted.push_str(&account);
-
-    // Add amount if present
-    if let Some(ref units) = posting.units
-        && let (Some(num), Some(curr)) = (units.number(), units.currency())
-    {
-        let num_str = num.to_string();
-        let curr_str = curr.to_string();
-        let amount_str = format!("{} {}", num_str, curr_str);
-
-        // Calculate padding to align amount at AMOUNT_COLUMN
-        let current_len = expected_indent + account.len();
-        let padding = if current_len < AMOUNT_COLUMN - amount_str.len() {
-            AMOUNT_COLUMN - amount_str.len() - current_len
-        } else {
-            2 // Minimum 2 spaces
-        };
-
-        formatted.push_str(&" ".repeat(padding));
-        formatted.push_str(&amount_str);
+    // No edit needed when the source line already matches the canonical
+    // form (ignoring trailing whitespace, which a separate pass strips).
+    if formatted.trim_end() == line.trim_end() {
+        return None;
     }
 
-    // Check if formatting changed anything significant
-    let line_trimmed_end = line.trim_end();
-    if formatted.trim_end() != line_trimmed_end
-        && (current_indent != expected_indent || needs_alignment(line, &formatted))
-    {
-        Some(TextEdit {
-            range: Range {
-                start: Position::new(line_num, 0),
-                end: Position::new(line_num, line.len() as u32),
-            },
-            new_text: formatted,
-        })
-    } else {
-        None
-    }
-}
-
-/// Check if line needs amount alignment.
-fn needs_alignment(original: &str, formatted: &str) -> bool {
-    // Simple heuristic: if the formatted version has different spacing, align
-    let orig_parts: Vec<&str> = original.split_whitespace().collect();
-    let fmt_parts: Vec<&str> = formatted.split_whitespace().collect();
-
-    // If content is the same but spacing is different, we need alignment
-    orig_parts == fmt_parts && original.trim() != formatted.trim()
+    Some(TextEdit {
+        range: Range {
+            start: Position::new(line_num, 0),
+            end: Position::new(line_num, line.len() as u32),
+        },
+        new_text: formatted,
+    })
 }
 
 #[cfg(test)]
@@ -283,6 +273,53 @@ mod tests {
                 .iter()
                 .any(|e| posting_lines.contains(&e.range.start.line)),
             "formatter emitted no edits for posting lines — alignment broken"
+        );
+    }
+
+    /// Regression test: the formatter must preserve a same-line
+    /// trailing comment on a posting. An earlier draft of the
+    /// unification (PR #1158, commit `e537755f`) delegated to
+    /// `format_posting`, which omits trailing comments — so the
+    /// formatter emitted edits that silently dropped them. The fix
+    /// is to route through `format_posting_line` (the helper that
+    /// `format_transaction` also uses on the on-disk path), which
+    /// appends `posting.trailing_comments[0]` to the line.
+    #[test]
+    fn test_formatting_preserves_trailing_comment_on_posting() {
+        // Indent is intentionally wrong (4-space) so the formatter
+        // *must* emit an edit; otherwise we'd be testing nothing.
+        let source = "\
+2024-01-15 * \"Coffee\"
+    Assets:Bank  -5.00 USD ; my comment
+    Expenses:Food
+";
+        let result = parse(source);
+        assert!(
+            result.errors.is_empty(),
+            "parse errors: {:?}",
+            result.errors
+        );
+
+        let params = DocumentFormattingParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: "file:///test.beancount".parse().unwrap(),
+            },
+            options: Default::default(),
+            work_done_progress_params: Default::default(),
+        };
+        let edits = handle_formatting(&params, source, &result).unwrap_or_default();
+
+        // Apply edits to the source and check the comment is still
+        // present on its original line.
+        let line1_edit = edits
+            .iter()
+            .find(|e| e.range.start.line == 1)
+            .expect("expected an edit on line 1 (the Assets:Bank posting)");
+        assert!(
+            line1_edit.new_text.contains("; my comment"),
+            "trailing comment dropped from canonical-formatted posting line; \
+             got new_text = {:?}",
+            line1_edit.new_text
         );
     }
 }
