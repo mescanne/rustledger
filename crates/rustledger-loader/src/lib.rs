@@ -1235,4 +1235,143 @@ include "more.beancount"
             "Identical tag #morning across files must share one Arc<str>"
         );
     }
+
+    /// Regression test responding to Copilot review on PR #1174: the
+    /// dedup pass must walk every interned payload type inside
+    /// `Metadata` maps — `MetaValue::{Account, Currency, Tag, Link,
+    /// Amount.currency}` — at both the transaction level and the
+    /// posting level. Before the meta walk was added, cross-file
+    /// metadata values held distinct `Arc<str>` allocations even when
+    /// they referenced identical strings.
+    ///
+    /// One multi-file fixture exercises all five variants in a single
+    /// load to keep the test focused on the dedup invariant rather
+    /// than the parse machinery.
+    #[test]
+    fn test_fresh_parse_deduplicates_metavalue_across_files() {
+        use rustledger_core::MetaValue;
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.add_file(
+            "main.beancount",
+            r#"
+2024-01-01 open Assets:Bank USD
+2024-01-01 open Expenses:Coffee
+
+2024-01-15 * "Latte"
+  counterparty_account: Assets:Bank
+  preferred_currency: USD
+  category_tag: #coffee
+  receipt_link: ^receipt-2024
+  fee_amount: 0.50 USD
+  Assets:Bank   -5.00 USD
+    settled_with: Assets:Bank
+  Expenses:Coffee  5.00 USD
+
+include "more.beancount"
+"#,
+        );
+        vfs.add_file(
+            "more.beancount",
+            r#"
+2024-01-16 * "Espresso"
+  counterparty_account: Assets:Bank
+  preferred_currency: USD
+  category_tag: #coffee
+  receipt_link: ^receipt-2024
+  fee_amount: 0.50 USD
+  Assets:Bank   -3.00 USD
+    settled_with: Assets:Bank
+  Expenses:Coffee  3.00 USD
+"#,
+        );
+
+        let result = Loader::new()
+            .with_filesystem(Box::new(vfs))
+            .load(Path::new("main.beancount"))
+            .unwrap();
+
+        let txns: Vec<&rustledger_core::Transaction> = result
+            .directives
+            .iter()
+            .filter_map(|s| match &s.value {
+                rustledger_core::Directive::Transaction(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(txns.len(), 2);
+
+        // --- Transaction-level meta: all four typed variants + Amount.currency ---
+
+        let MetaValue::Account(a1) = &txns[0].meta["counterparty_account"] else {
+            panic!("expected MetaValue::Account");
+        };
+        let MetaValue::Account(a2) = &txns[1].meta["counterparty_account"] else {
+            panic!("expected MetaValue::Account");
+        };
+        assert!(
+            a1.ptr_eq(a2),
+            "MetaValue::Account in cross-file meta must share Arc<str>"
+        );
+
+        let MetaValue::Currency(c1) = &txns[0].meta["preferred_currency"] else {
+            panic!("expected MetaValue::Currency");
+        };
+        let MetaValue::Currency(c2) = &txns[1].meta["preferred_currency"] else {
+            panic!("expected MetaValue::Currency");
+        };
+        assert!(
+            c1.ptr_eq(c2),
+            "MetaValue::Currency in cross-file meta must share Arc<str>"
+        );
+
+        let MetaValue::Tag(t1) = &txns[0].meta["category_tag"] else {
+            panic!("expected MetaValue::Tag");
+        };
+        let MetaValue::Tag(t2) = &txns[1].meta["category_tag"] else {
+            panic!("expected MetaValue::Tag");
+        };
+        assert!(
+            t1.ptr_eq(t2),
+            "MetaValue::Tag in cross-file meta must share Arc<str>"
+        );
+
+        let MetaValue::Link(l1) = &txns[0].meta["receipt_link"] else {
+            panic!("expected MetaValue::Link");
+        };
+        let MetaValue::Link(l2) = &txns[1].meta["receipt_link"] else {
+            panic!("expected MetaValue::Link");
+        };
+        assert!(
+            l1.ptr_eq(l2),
+            "MetaValue::Link in cross-file meta must share Arc<str>"
+        );
+
+        let MetaValue::Amount(am1) = &txns[0].meta["fee_amount"] else {
+            panic!("expected MetaValue::Amount");
+        };
+        let MetaValue::Amount(am2) = &txns[1].meta["fee_amount"] else {
+            panic!("expected MetaValue::Amount");
+        };
+        assert!(
+            am1.currency.ptr_eq(&am2.currency),
+            "MetaValue::Amount.currency in cross-file meta must share Arc<str>"
+        );
+
+        // --- Posting-level meta: the per-posting `intern_meta` call ---
+
+        let first_posting_0 = &txns[0].postings[0].value;
+        let first_posting_1 = &txns[1].postings[0].value;
+        let MetaValue::Account(p1) = &first_posting_0.meta["settled_with"] else {
+            panic!("expected MetaValue::Account in posting meta");
+        };
+        let MetaValue::Account(p2) = &first_posting_1.meta["settled_with"] else {
+            panic!("expected MetaValue::Account in posting meta");
+        };
+        assert!(
+            p1.ptr_eq(p2),
+            "Posting-level MetaValue::Account in cross-file meta must share Arc<str> \
+             (verifies the per-posting `intern_meta` call, not just the directive-level one)"
+        );
+    }
 }

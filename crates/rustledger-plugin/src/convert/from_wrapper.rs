@@ -234,10 +234,16 @@ pub(super) fn data_to_meta_value(data: &MetaValueData) -> MetaValue {
                 MetaValue::String(s.clone())
             }
         }
-        MetaValueData::Account(s) => MetaValue::Account(s.clone()),
-        MetaValueData::Currency(s) => MetaValue::Currency(s.clone()),
-        MetaValueData::Tag(s) => MetaValue::Tag(s.clone()),
-        MetaValueData::Link(s) => MetaValue::Link(s.clone()),
+        // Bridge from String-typed wire format into the host's typed
+        // newtypes. `From<&str>` wraps the string in a fresh `Arc<str>`
+        // (it does NOT consult an interner). Cross-file/cross-plugin
+        // canonicalization to a single `Arc<str>` per string happens
+        // later in `rustledger_loader::dedup::reintern_directives`,
+        // which walks meta payloads via `intern_meta`.
+        MetaValueData::Account(s) => MetaValue::Account(s.as_str().into()),
+        MetaValueData::Currency(s) => MetaValue::Currency(s.as_str().into()),
+        MetaValueData::Tag(s) => MetaValue::Tag(s.as_str().into()),
+        MetaValueData::Link(s) => MetaValue::Link(s.as_str().into()),
         MetaValueData::Amount(a) => {
             if let Ok(amount) = data_to_amount(a) {
                 MetaValue::Amount(amount)
