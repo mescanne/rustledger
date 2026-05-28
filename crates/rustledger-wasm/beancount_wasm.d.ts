@@ -113,6 +113,33 @@ export type MetaValueJson =
     | null;
 
 /**
+ * Tagged-union value used in `CustomDirective.values` (issue #1207).
+ *
+ * Unlike [`MetaValueJson`] (untagged, lossy for primitive-typed
+ * variants), `TypedValue` preserves the host `MetaValue` variant tag
+ * so JS consumers can distinguish a `Date` from a `String` from an
+ * `Account` — all of which would otherwise collapse to bare strings.
+ *
+ * Mirrors FFI-WASI's `TypedValue` shape exactly so portable consumers
+ * see identical envelopes across both bindings.
+ *
+ * Declared as a **discriminated union** rather than a single
+ * interface so `switch (v.type)` (or `if (v.type === 'amount')`)
+ * narrows `v.value` to the right payload shape.
+ */
+export type TypedValue =
+    | { type: "string"; value: string }
+    | { type: "account"; value: string }
+    | { type: "currency"; value: string }
+    | { type: "tag"; value: string }
+    | { type: "link"; value: string }
+    | { type: "date"; value: string }
+    | { type: "number"; value: string }
+    | { type: "bool"; value: boolean }
+    | { type: "amount"; value: { number: string; currency: string } }
+    | { type: "null"; value: null };
+
+/**
  * Valid directive types.
  */
 export type DirectiveType =
@@ -320,14 +347,15 @@ export interface QueryDirective extends Directive {
 /**
  * A custom directive — `custom TYPE arg1 arg2 ...`. `values` carries
  * the positional arguments after the type keyword (absent when there
- * are none); each value is a [`MetaValueJson`].
+ * are none). Each value is a [`TypedValue`] — the tagged shape that
+ * preserves the host `MetaValue` variant (issue #1207).
  */
 export interface CustomDirective extends Directive {
     type: "custom";
     /** Custom type keyword (the first word after `custom`) */
     custom_type: string;
-    /** Positional values after the type keyword */
-    values?: MetaValueJson[];
+    /** Positional values after the type keyword (tagged union; see [`TypedValue`]) */
+    values?: TypedValue[];
 }
 
 /**

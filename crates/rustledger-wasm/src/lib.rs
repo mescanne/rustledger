@@ -120,6 +120,29 @@ export type MetaValueJson =
     | { number: string; currency: string }
     | null;
 
+/**
+ * Tagged-union value used in the `custom` directive's `values` field
+ * (issue #1207). Preserves the host `MetaValue` variant tag — unlike
+ * `MetaValueJson`, which collapses `Date`/`String`/`Account` to a
+ * single bare-string shape. Mirrors FFI-WASI's `TypedValue` exactly.
+ *
+ * Declared as a discriminated union so `switch (v.type)` (or
+ * `if (v.type === 'amount')`) narrows `v.value` to the right payload
+ * shape — see `tsc` issue: a single interface with union types on
+ * both fields gives the cross-product, not the narrowing relationship.
+ */
+export type TypedValue =
+    | { type: 'string'; value: string }
+    | { type: 'account'; value: string }
+    | { type: 'currency'; value: string }
+    | { type: 'tag'; value: string }
+    | { type: 'link'; value: string }
+    | { type: 'date'; value: string }
+    | { type: 'number'; value: string }
+    | { type: 'bool'; value: boolean }
+    | { type: 'amount'; value: { number: string; currency: string } }
+    | { type: 'null'; value: null };
+
 /** A posting within a transaction. */
 export interface Posting {
     account: string;
@@ -198,7 +221,7 @@ export type Directive =
     | { type: 'document'; date: string; account: string; path: string; tags?: string[]; links?: string[]; meta?: Record<string, MetaValueJson> }
     | { type: 'price'; date: string; currency: string; amount: Amount; meta?: Record<string, MetaValueJson> }
     | { type: 'query'; date: string; name: string; query_string: string; meta?: Record<string, MetaValueJson> }
-    | { type: 'custom'; date: string; custom_type: string; values?: MetaValueJson[]; meta?: Record<string, MetaValueJson> };
+    | { type: 'custom'; date: string; custom_type: string; values?: TypedValue[]; meta?: Record<string, MetaValueJson> };
 
 /** Ledger options. */
 export interface LedgerOptions {
