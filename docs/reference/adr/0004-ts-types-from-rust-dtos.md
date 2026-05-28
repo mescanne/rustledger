@@ -2,7 +2,12 @@
 
 ## Status
 
-Proposed (May 2026) — spike landed in #1218; awaiting decision before implementation.
+Accepted — Phase 1 (May 2026). Spike landed in #1220; Phase 1
+implementation ships the per-DTO derives, the
+`scripts/regen-ts-bindings.sh` post-process, the generated
+`bindings/index.d.ts`, and the CI freshness gate. Phase 2 (replacing
+the inline `typescript_custom_section` with `include_str!` of the
+generated bundle) is deferred to a follow-up issue.
 
 ## Context
 
@@ -20,15 +25,20 @@ This ADR records the design decision for a structural fix.
 
 ## Spike
 
-Prototype landed in PR #1218 via `crates/rustledger-wasm/examples/tsrs_spike.rs`. The four DTOs that matter for the audit (`MetaValueJson`, `TypedValueJson`, `PostingJson`, `DirectiveJson`, plus supporting types) were mirrored verbatim into the spike with `#[derive(TS)]` added. Run with:
+Prototype landed in **PR #1220** via the temporary example
+`crates/rustledger-wasm/examples/tsrs_spike.rs`. The four DTOs that
+matter for the audit (`MetaValueJson`, `TypedValueJson`, `PostingJson`,
+`DirectiveJson`, plus supporting types) were mirrored verbatim into
+the spike with `#[derive(TS)]` added. ts-rs wrote per-type `.d.ts`
+files under `crates/rustledger-wasm/bindings/bindings/` (the outer
+`bindings/` is ts-rs's per-crate output root; the inner one comes
+from the `export_to = "bindings/"` attribute on each derive).
 
-```bash
-cargo test --example tsrs_spike -p rustledger-wasm --features ts-rs-spike
-```
-
-ts-rs writes per-type `.d.ts` files under `crates/rustledger-wasm/bindings/bindings/` (the outer `bindings/` is ts-rs's per-crate output root; the inner one comes from the `export_to = "bindings/"` attribute on each derive).
-
-**The spike is intentionally a snapshot of the production DTOs at the moment of writing.** It does not track future changes to `src/types.rs`. When Phase 1 lands, the production DTOs gain the `#[derive(TS)]` and the spike example is deleted — the spike's job is to inform the design decision, not stay current.
+The spike was intentionally a snapshot of the production DTOs at the
+moment of writing — not a tracked artifact. Phase 1 (PR #1223) added
+`#[derive(TS)]` directly to the production DTOs and deleted the
+spike example; the spike's job was to inform the design decision,
+not stay current.
 
 ### What ts-rs got right
 
