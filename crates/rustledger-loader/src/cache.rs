@@ -79,6 +79,7 @@ pub struct CachedOptions {
     pub use_legacy_fixed_tolerances: bool,
     pub experiment_explicit_tolerances: bool,
     pub booking_method: String,
+    pub set_options: Vec<String>,
     pub render_commas: bool,
     pub allow_pipe_separator: bool,
     pub long_string_maxlines: u32,
@@ -115,6 +116,7 @@ impl From<&Options> for CachedOptions {
             use_legacy_fixed_tolerances: opts.use_legacy_fixed_tolerances,
             experiment_explicit_tolerances: opts.experiment_explicit_tolerances,
             booking_method: opts.booking_method.clone(),
+            set_options: opts.set_options.iter().cloned().collect(),
             render_commas: opts.render_commas,
             allow_pipe_separator: opts.allow_pipe_separator,
             long_string_maxlines: opts.long_string_maxlines,
@@ -159,6 +161,7 @@ impl From<CachedOptions> for Options {
         opts.use_legacy_fixed_tolerances = cached.use_legacy_fixed_tolerances;
         opts.experiment_explicit_tolerances = cached.experiment_explicit_tolerances;
         opts.booking_method = cached.booking_method;
+        opts.set_options = cached.set_options.into_iter().collect();
         opts.render_commas = cached.render_commas;
         opts.allow_pipe_separator = cached.allow_pipe_separator;
         opts.long_string_maxlines = cached.long_string_maxlines;
@@ -1013,6 +1016,8 @@ mod tests {
         opts.title = Some("Test Ledger".to_string());
         opts.operating_currency = vec!["USD".to_string(), "EUR".to_string()];
         opts.render_commas = true;
+        opts.set_options.insert("booking_method".to_string());
+        opts.set_options.insert("operating_currency".to_string());
 
         let cached = CachedOptions::from(&opts);
         let restored: Options = cached.into();
@@ -1020,6 +1025,8 @@ mod tests {
         assert_eq!(restored.title, Some("Test Ledger".to_string()));
         assert_eq!(restored.operating_currency, vec!["USD", "EUR"]);
         assert!(restored.render_commas);
+        assert!(restored.set_options.contains("booking_method"));
+        assert!(restored.set_options.contains("operating_currency"));
     }
 
     #[test]

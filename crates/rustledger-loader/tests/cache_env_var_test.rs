@@ -226,3 +226,54 @@ fn empty_disable_env_value_still_disables() {
 
     let _ = std::fs::remove_dir_all(&temp);
 }
+
+#[test]
+fn test_cache_equivalence_of_booking_method_none() {
+    use rustledger_loader::Loader;
+
+    let _lock = ENV_LOCK.lock().unwrap();
+
+    let temp = std::env::temp_dir().join("rustledger_cache_equivalence_test");
+    let _ = std::fs::remove_dir_all(&temp);
+    let _ = std::fs::create_dir_all(&temp);
+
+    let beancount_file = temp.join("ledger.beancount");
+    std::fs::write(
+        &beancount_file,
+        r#"option "booking_method" "NONE"
+
+2023-01-01 open Assets:Test
+"#,
+    )
+    .unwrap();
+
+    // 1. Load fresh
+    let mut loader = Loader::new();
+    let raw_fresh = loader.load(&beancount_file).expect("should load fresh");
+
+    // Verify fresh options are parsed correctly
+    assert_eq!(raw_fresh.options.booking_method, "NONE");
+    assert!(raw_fresh.options.set_options.contains("booking_method"));
+
+    // 2. Save cache entry to disk
+    let entry = CacheEntry {
+        directives: raw_fresh.directives.clone(),
+        options: CachedOptions::from(&raw_fresh.options),
+        plugins: vec![],
+        files: vec![beancount_file.to_string_lossy().into_owned()],
+    };
+    save_cache_entry(&beancount_file, &entry).expect("save should succeed");
+
+    // Verify cache file exists
+    assert!(cache_path(&beancount_file).exists());
+
+    // 3. Load cache entry from disk
+    let loaded_entry = load_cache_entry(&beancount_file).expect("load should succeed");
+    let restored_opts = Options::from(loaded_entry.options);
+
+    // Verify loaded options match the fresh options exactly
+    assert_eq!(restored_opts.booking_method, "NONE");
+    assert!(restored_opts.set_options.contains("booking_method"));
+
+    let _ = std::fs::remove_dir_all(&temp);
+}
